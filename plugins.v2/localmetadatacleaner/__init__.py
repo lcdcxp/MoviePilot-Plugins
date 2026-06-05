@@ -39,7 +39,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -285,6 +285,9 @@ class LocalMetadataCleaner(_PluginBase):
     def get_page(self) -> List[dict]:
         """插件详情页：参考签到历史页，使用概览卡片 + 紧凑记录列表。"""
         state = self._load_state()
+        # 兼容旧队列：如果 10 天复查任务缺少具体缺图集名称，打开详情页时轻量刷新一次缓存。
+        if self._refresh_queue_preview_cache_for_display(state):
+            self.save_data("state", state)
         queue = state.get("queue") or {}
         history = state.get("history") or []
         queue_count = len(queue)
@@ -441,10 +444,16 @@ class LocalMetadataCleaner(_PluginBase):
                 total = int(preview.get("total") or 0)
                 detail_lines.append(self._mini_line("当前缺图", f"{total} 集" if total else "暂未发现，到期会复查全部 STRM"))
                 names = preview.get("names") or []
+                # 兼容旧数据：老版本可能只保存 total，没有保存 names。
+                if total and not names:
+                    names = preview.get("labels") or preview.get("items") or []
                 if names:
-                    detail_lines.append({"component": "div", "props": {"class": "d-flex flex-wrap ga-1 mt-2"}, "content": [self._chip(str(name), "warning") for name in names]})
-                    if preview.get("truncated"):
+                    detail_lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"}, "text": "缺图集："})
+                    detail_lines.append({"component": "div", "props": {"class": "d-flex flex-wrap ga-1 mt-1"}, "content": [self._chip(str(name), "warning") for name in names[:8]]})
+                    if preview.get("truncated") or len(names) > 8:
                         detail_lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": "仅展示前 8 集，到期仍会检查全部 STRM。"})
+                elif total:
+                    detail_lines.append({"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "density": "compact", "class": "mt-2", "text": "当前任务来自旧缓存，只记录了缺图数量；保存一次配置或等待下次事件后会刷新具体集数。"}})
             else:
                 detail_lines.append(self._mini_line("当前缺图", "剧名目录暂不可访问，到期会再次检查"))
 
@@ -934,7 +943,9 @@ class LocalMetadataCleaner(_PluginBase):
                 existing["due_at"] = self._ts_to_str(due_ts)
             existing["duplicate_count"] = int(existing.get("duplicate_count") or 0) + 1
             existing["reason"] = reason or existing.get("reason") or ""
-            existing.setdefault("missing_preview", self._build_missing_preview(show_root, limit=8))
+            preview = existing.get("missing_preview") or {}
+            if self._preview_needs_refresh(preview):
+                existing["missing_preview"] = self._build_missing_preview(show_root, limit=8)
             existing["last_msg"] = f"10天复查任务已合并，复查时间：{existing.get('due_at')}"
             return
         queue[key] = {
@@ -1107,13 +1118,58 @@ class LocalMetadataCleaner(_PluginBase):
             logger.warning(f"监控strm刮削网盘：检查剧集单集图片失败：{show_root} - {err}")
         return sorted(missing, key=lambda p: str(p))
 
+    @staticmethod
+    def _preview_needs_refresh(preview: Any) -> bool:
+        """判断 10 天复查任务的缺图预览缓存是否需要补全。
+
+        老版本任务可能只有 total，没有 names，导致详情页看不到具体哪几集。
+        """
+        if not isinstance(preview, dict) or not preview:
+            return True
+        if not preview.get("exists"):
+            return True
+        total = int(preview.get("total") or 0)
+        names = preview.get("names") or preview.get("labels") or preview.get("items") or []
+        return total > 0 and not names
+
+    def _refresh_queue_preview_cache_for_display(self, state: Dict[str, Any]) -> bool:
+        """打开详情页时补齐旧队列中的缺图集名称缓存。
+
+        只在缓存缺少 names 时扫描，避免每次打开页面都遍历 STRM 目录。
+        """
+        queue = state.get("queue") or {}
+        if not isinstance(queue, dict) or not queue:
+            return False
+        changed = False
+        refreshed = 0
+        for item in queue.values():
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("task_type") or "") != "tv_recheck":
+                continue
+            preview = item.get("missing_preview") or {}
+            if not self._preview_needs_refresh(preview):
+                continue
+            show_root = Path(str(item.get("show_root") or ""))
+            if not str(show_root):
+                continue
+            item["missing_preview"] = self._build_missing_preview(show_root, limit=8)
+            changed = True
+            refreshed += 1
+            # 页面展示最多 10 个任务，防止一次打开页面扫描过多剧集。
+            if refreshed >= 10:
+                break
+        return changed
+
     def _build_missing_preview(self, show_root: Path, limit: int = 30) -> Dict[str, Any]:
         try:
             if not show_root.exists() or not show_root.is_dir():
                 return {"exists": False, "total": 0, "names": []}
             missing = self._find_missing_episode_images(show_root)
-            names = [self._episode_label(p, show_root) for p in missing[:max(int(limit or 0), 0)]]
-            return {"exists": True, "total": len(missing), "names": names, "truncated": len(missing) > len(names)}
+            take = max(int(limit or 0), 0)
+            names = [self._episode_label(p, show_root) for p in missing[:take]]
+            paths = [str(p) for p in missing[:take]]
+            return {"exists": True, "total": len(missing), "names": names, "paths": paths, "truncated": len(missing) > len(names), "refresh_time": self._now_iso()}
         except Exception as err:
             logger.debug(f"监控strm刮削网盘：生成缺图集预览失败：{show_root} - {err}")
             return {"exists": False, "total": 0, "names": []}

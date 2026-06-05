@@ -22,3 +22,4 @@ https://github.com/你的GitHub用户名/你的仓库名
 ## 更新记录
 
 - LocalMetadataCleaner v1.1：修复配置布局与队列显示相关问题，优化待处理任务、最近处理记录和页面展示。
+- LocalMetadataCleaner v1.2：修复已知问题并继续优化任务队列、页面布局和刮削处理逻辑。
