@@ -1,0 +1,77 @@
+# CloudDrive2 Webhook 模板
+# 适用于 MoviePilot 本地插件：CD2Notify / CloudDrive2文件通知
+#
+# 使用前只需要改两处：
+# 1. base_url 改成你的 MoviePilot 地址，例如 http://192.168.1.100:3001
+# 2. apikey 改成你的 MoviePilot 系统 API_TOKEN
+#
+# 如果插件里开启“等待任务结束后通知”，CloudDrive2 模板不用改；
+# 插件会自动把连续文件变化合并成一条汇总通知。
+
+[global_params]
+base_url = "http://你的MP地址:端口"
+enabled = true
+time_format = "local:%Y-%m-%d %H:%M:%S"
+
+[global_params.default_headers]
+content-type = "application/json"
+user-agent = "clouddrive2/{version}"
+
+# 文件变动通知：新增 / 删除 / 移动重命名
+[file_system_watcher]
+url = "{base_url}/api/v1/plugin/CD2Notify/file_notify?apikey=你的MP_API_TOKEN"
+method = "POST"
+enabled = true
+
+body = '''
+{
+  "device_name": "{device_name}",
+  "user_name": "{user_name}",
+  "version": "{version}",
+  "event_category": "{event_category}",
+  "event_name": "{event_name}",
+  "event_time": "{event_time}",
+  "send_time": "{send_time}",
+  "data": [
+    {
+      "action": "{action}",
+      "is_dir": "{is_dir}",
+      "source_file": "{source_file}",
+      "destination_file": "{destination_file}"
+    }
+  ]
+}
+'''
+
+[file_system_watcher.headers]
+content-type = "application/json"
+
+# 挂载点变化通知：挂载 / 卸载
+[mount_point_watcher]
+url = "{base_url}/api/v1/plugin/CD2Notify/mount_notify?apikey=你的MP_API_TOKEN"
+method = "POST"
+enabled = true
+
+body = '''
+{
+  "device_name": "{device_name}",
+  "user_name": "{user_name}",
+  "version": "{version}",
+  "event_category": "{event_category}",
+  "event_name": "{event_name}",
+  "event_time": "{event_time}",
+  "send_time": "{send_time}",
+  "data": [
+    {
+      "action": "{action}",
+      "mount_point": "{mount_point}",
+      "status": "{status}",
+      "reason": "{reason}"
+    }
+  ]
+}
+'''
+
+[mount_point_watcher.headers]
+content-type = "application/json"
+user-agent = "clouddrive2/{version}/mount"
