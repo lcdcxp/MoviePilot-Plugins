@@ -49,15 +49,16 @@
   },
   "LocalMetadataCleaner": {
     "name": "监控strm刮削网盘",
-    "description": "复用媒体库服务器通知插件使用的 MP 全局入库事件：检查 STRM 库刮削信息，需要时通过网盘路径触发 MP 刮削。",
+    "description": "复用 MP 全局入库事件：按 STRM 库判断刮削完整度，需要时通过网盘真实路径触发 MP 刮削。",
     "labels": "STRM,Emby,网盘,刮削",
-    "version": "1",
+    "version": "1.1",
     "icon": "https://movie-pilot.org/assets/icon.png",
     "author": "jidian",
     "level": 1,
     "v2": true,
     "history": {
-      "v1": "电影按 STRM 片名目录完整度判断；电视剧按 STRM 剧名根目录和单集图片判断，缺图单集延迟刮削，10 天复查。"
+      "v1": "优化代码结构：删除备用独立 Webhook，电视剧入库按剧名目录合并，详情页使用缓存预览，减少日志刷屏并优化历史去重。",
+      "v1.1": "修复配置布局与队列显示相关问题，优化待处理任务、最近处理记录和页面展示。"
     }
   }
 }

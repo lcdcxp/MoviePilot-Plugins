@@ -9,7 +9,6 @@ from threading import RLock, Timer
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
-from fastapi import Request
 from apscheduler.triggers.cron import CronTrigger
 
 from app.core.event import eventmanager
@@ -40,7 +39,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "1"
+    plugin_version = "1.1"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -72,7 +71,6 @@ class LocalMetadataCleaner(_PluginBase):
     _scrape: bool = True
     _overwrite: bool = False
     _storage: str = "local"
-    _webhook_token: str = ""
 
     # 队列操作
     _queue_delete_items: List[str] = []
@@ -82,6 +80,7 @@ class LocalMetadataCleaner(_PluginBase):
 
     _lock = RLock()
     _timers: List[Timer] = []
+    _next_timer_due_ts: float = 0
     _storagechain = None
     mschain = None
     mediaserver_helper = None
@@ -104,26 +103,14 @@ class LocalMetadataCleaner(_PluginBase):
             self._notify = bool(config.get("notify", True))
             self._onlyonce = bool(config.get("onlyonce", False))
             self._media_server = str(config.get("media_server") or "").strip()
-            old_servers = self._to_list(config.get("selected_servers") or [])
-            if not self._media_server and old_servers:
-                self._media_server = old_servers[0]
-            self._include_libraries = self._to_list(config.get("include_libraries") or config.get("emby_libraries") or [])
+            self._include_libraries = self._to_list(config.get("include_libraries") or [])
             self._all_libraries = config.get("all_libraries") or []
             if not isinstance(self._all_libraries, list):
                 self._all_libraries = []
 
-            # 兼容旧版字段名
-            self._strm_check_root = str(
-                config.get("strm_check_root")
-                or config.get("emby_strm_root")
-                or "/media"
-            ).strip().rstrip("/") or "/media"
-            self._scrape_target_root = str(
-                config.get("scrape_target_root")
-                or config.get("cd2_real_root")
-                or "/CD2/115/CMS影库/影视"
-            ).strip().rstrip("/") or "/CD2/115/CMS影库/影视"
-            self._target_depth = int(self._to_float(config.get("target_depth"), 3))
+            self._strm_check_root = str(config.get("strm_check_root") or "/media").strip().rstrip("/") or "/media"
+            self._scrape_target_root = str(config.get("scrape_target_root") or "/CD2/115/CMS影库/影视").strip().rstrip("/") or "/CD2/115/CMS影库/影视"
+            self._target_depth = 3
 
             self._cron = str(config.get("cron") or "*/1 * * * *").strip() or "*/1 * * * *"
             self._initial_check_delay_seconds = int(self._to_float(config.get("initial_check_delay_seconds"), 10))
@@ -133,7 +120,6 @@ class LocalMetadataCleaner(_PluginBase):
             self._overwrite = bool(config.get("overwrite", False))
             # 页面不再显示存储标识，普通本地映射固定使用 local
             self._storage = "local"
-            self._webhook_token = str(config.get("webhook_token") or "").strip()
 
             self._queue_delete_items = self._to_list(config.get("queue_delete_items") or [])
             self._queue_delete_confirm = bool(config.get("queue_delete_confirm", False))
@@ -189,12 +175,7 @@ class LocalMetadataCleaner(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return [{
-            "path": "/emby_webhook",
-            "endpoint": self.emby_webhook,
-            "methods": ["GET", "POST"],
-            "summary": "备用：直接接收 Emby 入库通知，GET 用于测试连通性"
-        }]
+        return []
 
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled:
@@ -213,6 +194,7 @@ class LocalMetadataCleaner(_PluginBase):
         }]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """插件配置页：常用项平铺，保持页面简洁。"""
         return [
             {
                 "component": "VForm",
@@ -259,7 +241,7 @@ class LocalMetadataCleaner(_PluginBase):
                         "content": [
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "overwrite", "label": "刮削覆盖模式"}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "clear_history", "label": "清空历史记录"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VAlert", "props": {"type": "success", "variant": "tonal", "text": "历史记录最多保留最新 100 条；清空历史记录不会影响待处理队列。"}}]}
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": []}
                         ]
                     },
                     {
@@ -272,6 +254,7 @@ class LocalMetadataCleaner(_PluginBase):
                     },
                     {
                         "component": "VRow",
+                        "props": {"class": "mt-2"},
                         "content": [
                             {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": self._help_text()}}]}
                         ]
@@ -287,7 +270,6 @@ class LocalMetadataCleaner(_PluginBase):
             "all_libraries": [],
             "strm_check_root": "/media",
             "scrape_target_root": "/CD2/115/CMS影库/影视",
-            "target_depth": 3,
             "cron": "*/1 * * * *",
             "initial_check_delay_seconds": 10,
             "episode_scrape_delay_minutes": 6,
@@ -295,38 +277,299 @@ class LocalMetadataCleaner(_PluginBase):
             "scrape": True,
             "overwrite": False,
             "clear_history": False,
-            "storage": "local",
-            "webhook_token": "",
             "queue_delete_items": [],
             "queue_delete_confirm": False,
-            "queue_clear_all": False,
-            # 兼容旧配置字段
-            "emby_strm_root": "/media",
-            "cd2_real_root": "/CD2/115/CMS影库/影视"
+            "queue_clear_all": False
         }
 
     def get_page(self) -> List[dict]:
+        """插件详情页：参考签到历史页，使用概览卡片 + 紧凑记录列表。"""
         state = self._load_state()
         queue = state.get("queue") or {}
         history = state.get("history") or []
+        queue_count = len(queue)
+        history_display = self._history_for_display(history, limit=10)
+
+        task_stats = self._queue_stats(queue)
+        last_record = history[-1] if history else {}
+
         cards: List[Dict[str, Any]] = []
-        if queue:
-            cards.append({"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": f"当前待处理任务：{len(queue)} 个。如需删除任务，请到插件设置页的‘待处理队列操作’中选择任务并保存。"}})
-        for key, item in list(queue.items())[-30:]:
-            cards.append({"component": "VCard", "props": {"variant": "tonal", "class": "mb-2"}, "content": [
-                {"component": "VCardTitle", "text": key},
-                {"component": "VCardText", "text": self._queue_text(item)}
+
+        cards.append({
+            "component": "VRow",
+            "props": {"class": "mb-3"},
+            "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                    {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 rounded-lg"}, "content": [
+                        self._card_header("mdi-view-dashboard-outline", "运行概览"),
+                        {"component": "VDivider", "props": {"class": "my-3"}},
+                        {"component": "VRow", "content": [
+                            self._summary_metric("插件状态", "已启用" if self._enabled else "未启用", "success" if self._enabled else "grey"),
+                            self._summary_metric("待处理", f"{queue_count} 个", "info" if queue_count else "success"),
+                            self._summary_metric("10天复查", f"{task_stats.get('tv_recheck', 0)} 个", "warning" if task_stats.get('tv_recheck') else "grey"),
+                            self._summary_metric("单集刮削", f"{task_stats.get('episode_scrape', 0)} 个", "purple" if task_stats.get('episode_scrape') else "grey"),
+                        ]},
+                        {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mt-3", "text": self._overview_text(last_record)}}
+                    ]}
+                ]},
+                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                    {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 rounded-lg"}, "content": [
+                        self._card_header("mdi-folder-sync-outline", "路径与规则"),
+                        {"component": "VDivider", "props": {"class": "my-3"}},
+                        {"component": "VRow", "content": [
+                            self._path_metric("STRM 检查根路径", self._strm_check_root or "/media"),
+                            self._path_metric("MP 刮削目标根路径", self._scrape_target_root or "/CD2/115/CMS影库/影视"),
+                        ]},
+                        {"component": "VAlert", "props": {"type": "success", "variant": "tonal", "density": "compact", "class": "mt-3", "text": "判断是否完整只检查 STRM 库；需要刮削时再把路径映射到 MP 刮削目标。"}}
+                    ]}
+                ]}
+            ]
+        })
+
+        cards.append(self._queue_section(queue, queue_count))
+        cards.append(self._history_section(history_display))
+
+        if not queue and not history_display:
+            cards.append({
+                "component": "VAlert",
+                "props": {"type": "success", "variant": "tonal", "class": "mt-3", "text": "暂无待处理任务和历史记录。"}
+            })
+
+        return [{"component": "div", "props": {"class": "pa-2"}, "content": cards}]
+
+    def _queue_section(self, queue: Dict[str, Any], queue_count: int) -> Dict[str, Any]:
+        queue_items = list(queue.items())[-10:] if queue else []
+        content: List[Dict[str, Any]] = [
+            self._section_title("mdi-timer-sand", f"待处理任务（{queue_count} 个）", "如需删除任务，请到插件设置页的“待处理队列操作”中选择并保存。")
+        ]
+        if queue_items:
+            content.append({"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [self._task_row_card(key, item)]}
+                for key, item in queue_items
             ]})
-        if history:
-            cards.append({"component": "VAlert", "props": {"type": "success", "variant": "tonal", "text": "最近处理记录"}})
-            for item in list(reversed(history[-20:])):
-                cards.append({"component": "VCard", "props": {"variant": "tonal", "class": "mb-2"}, "content": [
-                    {"component": "VCardTitle", "text": item.get("scope") or item.get("folder", "")},
-                    {"component": "VCardText", "text": self._history_text(item)}
-                ]})
-        if not cards:
-            return [{"component": "div", "props": {"class": "text-center"}, "text": "暂无待处理队列和历史记录"}]
-        return [{"component": "div", "props": {"class": "grid gap-3"}, "content": cards}]
+            if queue_count > len(queue_items):
+                content.append({"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "density": "compact", "class": "mt-2", "text": f"页面仅显示最新 {len(queue_items)} 个任务，实际队列共有 {queue_count} 个。"}})
+        else:
+            content.append({"component": "VAlert", "props": {"type": "success", "variant": "tonal", "density": "compact", "text": "当前没有待处理任务。"}})
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 mb-3 rounded-lg"}, "content": content}
+
+    def _history_section(self, history_display: List[Dict[str, Any]]) -> Dict[str, Any]:
+        content: List[Dict[str, Any]] = [
+            self._section_title("mdi-history", "最近处理记录", "已做展示去重。")
+        ]
+        if history_display:
+            content.append({"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [self._history_row_card(item)]}
+                for item in history_display
+            ]})
+        else:
+            content.append({"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "暂无最近处理记录。"}})
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 mb-3 rounded-lg"}, "content": content}
+
+    @staticmethod
+    def _card_header(icon: str, title: str) -> Dict[str, Any]:
+        return {"component": "div", "props": {"class": "d-flex align-center ga-2 text-h6 font-weight-medium"}, "content": [
+            {"component": "VIcon", "props": {"icon": icon, "color": "primary"}},
+            {"component": "span", "text": title}
+        ]}
+
+    @staticmethod
+    def _section_title(icon: str, title: str, subtitle: str = "") -> Dict[str, Any]:
+        content: List[Dict[str, Any]] = [
+            {"component": "div", "props": {"class": "d-flex align-center ga-2"}, "content": [
+                {"component": "VIcon", "props": {"icon": icon, "color": "primary", "size": "small"}},
+                {"component": "span", "props": {"class": "text-h6 font-weight-medium"}, "text": title}
+            ]}
+        ]
+        if subtitle:
+            content.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": subtitle})
+        content.append({"component": "VDivider", "props": {"class": "my-3"}})
+        return {"component": "div", "content": content}
+
+    @staticmethod
+    def _summary_metric(label: str, value: str, color: str = "grey") -> Dict[str, Any]:
+        return {"component": "VCol", "props": {"cols": 6, "sm": 3}, "content": [
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": label},
+            {"component": "VChip", "props": {"color": color, "variant": "tonal", "size": "small", "class": "font-weight-medium"}, "text": value}
+        ]}
+
+    @staticmethod
+    def _path_metric(label: str, value: str) -> Dict[str, Any]:
+        return {"component": "VCol", "props": {"cols": 12, "sm": 6}, "content": [
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": label},
+            {"component": "VSheet", "props": {"class": "pa-2 rounded text-body-2", "color": "grey-lighten-4"}, "text": value}
+        ]}
+
+    def _overview_text(self, last_record: Dict[str, Any]) -> str:
+        if not last_record:
+            return "等待 MP 全局 Webhook 入库事件。"
+        t = str(last_record.get("time") or "")
+        action = self._action_label(str(last_record.get("action") or ""))
+        scope = self._short_path(str(last_record.get("scope") or last_record.get("folder") or ""))
+        return f"最近处理：{t} · {action} · {scope}" if scope else f"最近处理：{t} · {action}"
+
+    @staticmethod
+    def _queue_stats(queue: Dict[str, Any]) -> Dict[str, int]:
+        stats: Dict[str, int] = {}
+        for item in (queue or {}).values():
+            task_type = str(item.get("task_type") or "unknown")
+            stats[task_type] = stats.get(task_type, 0) + 1
+        return stats
+
+    def _task_row_card(self, key: str, item: Dict[str, Any]) -> Dict[str, Any]:
+        task_type = str(item.get("task_type") or "")
+        title = self._queue_title(key, item)
+        status = str(item.get("status") or "")
+        due_at = str(item.get("due_at") or "")
+        strm = str(item.get("strm_path") or item.get("episode_strm") or item.get("show_root") or "")
+        target = str(item.get("scrape_target") or item.get("scrape_dir") or "")
+        chips = [self._chip(self._task_type_label(task_type), self._task_color(task_type))]
+        if status:
+            chips.append(self._chip(status, "grey"))
+        if due_at:
+            chips.append(self._chip(f"到期 {due_at}", "info"))
+
+        detail_lines: List[Dict[str, Any]] = []
+        if strm:
+            detail_lines.append(self._mini_line("STRM", self._short_path(strm)))
+        if target:
+            detail_lines.append(self._mini_line("刮削目标", self._short_path(target)))
+
+        if task_type == "tv_recheck":
+            preview = item.get("missing_preview") or {}
+            if preview.get("exists"):
+                total = int(preview.get("total") or 0)
+                detail_lines.append(self._mini_line("当前缺图", f"{total} 集" if total else "暂未发现，到期会复查全部 STRM"))
+                names = preview.get("names") or []
+                if names:
+                    detail_lines.append({"component": "div", "props": {"class": "d-flex flex-wrap ga-1 mt-2"}, "content": [self._chip(str(name), "warning") for name in names]})
+                    if preview.get("truncated"):
+                        detail_lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": "仅展示前 8 集，到期仍会检查全部 STRM。"})
+            else:
+                detail_lines.append(self._mini_line("当前缺图", "剧名目录暂不可访问，到期会再次检查"))
+
+        msg = str(item.get("last_msg") or "")
+        if msg:
+            detail_lines.append(self._mini_line("说明", msg))
+
+        return {"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 rounded-lg"}, "content": [
+            {"component": "div", "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-2"}, "content": [
+                {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium"}, "text": title},
+                {"component": "div", "props": {"class": "d-flex flex-wrap ga-1"}, "content": chips}
+            ]},
+            {"component": "div", "props": {"class": "mt-2"}, "content": detail_lines}
+        ]}
+
+    def _history_row_card(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        title = self._short_path(str(item.get("scope") or item.get("folder") or "处理记录"))
+        action = self._action_label(str(item.get("action") or ""))
+        t = str(item.get("time") or "")
+        scrape = item.get("scrape")
+        if scrape is True:
+            result_chip = self._chip("刮削已触发", "success")
+        elif scrape is False:
+            result_chip = self._chip("刮削失败", "error")
+        else:
+            result_chip = self._chip("记录", "grey")
+
+        detail_lines: List[Dict[str, Any]] = []
+        folder = str(item.get("folder") or "")
+        if folder:
+            detail_lines.append(self._mini_line("目标", self._short_path(folder)))
+        scrape_msg = str(item.get("scrape_msg") or "")
+        if scrape_msg:
+            detail_lines.append(self._mini_line("刮削", scrape_msg))
+        note = str(item.get("note") or "")
+        if note:
+            detail_lines.append(self._mini_line("说明", note))
+        dup = int(item.get("duplicate_count") or 0)
+        if dup > 1:
+            detail_lines.append(self._mini_line("重复合并", f"{dup} 次"))
+
+        return {"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 rounded-lg"}, "content": [
+            {"component": "div", "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-2"}, "content": [
+                {"component": "div", "content": [
+                    {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium"}, "text": title},
+                    {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": f"{t} · {action}"}
+                ]},
+                {"component": "div", "content": [result_chip]}
+            ]},
+            {"component": "div", "props": {"class": "mt-2"}, "content": detail_lines}
+        ]}
+
+    @staticmethod
+    def _chip(text: str, color: str = "grey") -> Dict[str, Any]:
+        return {"component": "VChip", "props": {"color": color, "variant": "tonal", "size": "small", "class": "mr-1 mb-1"}, "text": text}
+
+    @staticmethod
+    def _mini_line(label: str, value: str) -> Dict[str, Any]:
+        return {"component": "div", "props": {"class": "text-caption mb-1"}, "content": [
+            {"component": "span", "props": {"class": "text-medium-emphasis"}, "text": f"{label}："},
+            {"component": "span", "text": value}
+        ]}
+
+    @staticmethod
+    def _task_type_label(task_type: str) -> str:
+        return {
+            "initial": "入库检查",
+            "episode_scrape": "单集刮削",
+            "tv_recheck": "10天复查",
+        }.get(task_type, task_type or "任务")
+
+    @staticmethod
+    def _task_color(task_type: str) -> str:
+        return {
+            "initial": "primary",
+            "episode_scrape": "purple",
+            "tv_recheck": "warning",
+        }.get(task_type, "grey")
+
+    @staticmethod
+    def _action_label(action: str) -> str:
+        mapping = {
+            "movie_complete_skip": "电影完整跳过",
+            "movie_incomplete_scrape": "电影补刮削",
+            "tv_root_no_metadata_scrape_whole_show": "整剧刮削",
+            "tv_root_no_metadata_merge_existing_whole_show_scrape": "整剧事件合并",
+            "episode_missing_image_schedule_scrape": "单集缺图",
+            "episode_scrape_done": "单集刮削完成",
+            "episode_scrape_failed": "单集刮削失败",
+            "episode_delayed_scrape": "单集延迟刮削",
+            "tv_episode_missing_image_schedule_scrape": "单集缺图",
+            "tv_episode_image_exists_skip_initial": "单集完整跳过",
+            "movie_metadata_complete_skip": "电影完整跳过",
+            "movie_metadata_incomplete_scrape": "电影补刮削",
+            "tv_recheck_missing_episodes_schedule_scrape": "10天复查缺图",
+            "tv_recheck_complete": "10天复查完成",
+            "queue_cleared_by_user": "清空队列",
+            "queue_deleted_by_user": "删除任务",
+        }
+        return mapping.get(action, action or "记录")
+
+    @staticmethod
+    def _short_path(path_text: str, max_len: int = 86) -> str:
+        text = str(path_text or "")
+        if len(text) <= max_len:
+            return text
+        return "…" + text[-max_len:]
+
+    @staticmethod
+    def _history_for_display(history: List[Dict[str, Any]], limit: int = 12) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        seen = set()
+        for item in reversed(history or []):
+            key = (
+                str(item.get("action") or ""),
+                str(item.get("scope") or ""),
+                str(item.get("folder") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+            if len(result) >= limit:
+                break
+        return result
 
     def stop_service(self):
         try:
@@ -336,31 +579,10 @@ class LocalMetadataCleaner(_PluginBase):
                 except Exception:
                     pass
             self._timers = []
+            self._next_timer_due_ts = 0
         except Exception:
             pass
         self._storagechain = None
-
-    async def emby_webhook(self, request: Request, apikey: str = "", token: str = "") -> Dict[str, Any]:
-        """备用接口：仍建议使用 MP 全局 /api/v1/webhook。"""
-        try:
-            if not self._check_webhook_auth(request, apikey=apikey, token=token):
-                return {"success": False, "message": "Webhook 密钥错误"}
-            method = str(getattr(request, "method", "") or "").upper()
-            if method == "GET":
-                return {"success": True, "message": "Webhook 地址可访问。实际入库通知请使用 POST + application/json。", "enabled": bool(self._enabled)}
-            if not self._enabled:
-                return {"success": False, "message": "插件未启用"}
-            payload = await self._read_request_payload(request)
-            event_name, has_event = self._extract_event_name(payload)
-            if has_event and event_name and not self._is_item_added_event(event_name):
-                return {"success": True, "ignored": True, "message": f"非入库事件已忽略：{event_name}"}
-            raw_path = self._extract_payload_path(payload)
-            if not raw_path:
-                return {"success": False, "message": "未解析到媒体路径"}
-            return self._register_incoming_path(payload=payload, raw_path=raw_path, event_name=event_name, source="plugin_api")
-        except Exception as err:
-            logger.error(f"监控strm刮削网盘：处理备用 Emby Webhook 失败：{err}\n{traceback.format_exc()}")
-            return {"success": False, "message": str(err)}
 
     @eventmanager.register(EventType.WebhookMessage)
     def on_webhook_message(self, event):
@@ -415,9 +637,15 @@ class LocalMetadataCleaner(_PluginBase):
         if not info.get("success"):
             return {"success": False, "message": info.get("message") or "路径分析失败", "raw_path": raw_path}
 
-        task_key = f"initial::{raw_path}"
         now_ts = time.time()
         now_iso = self._now_iso()
+
+        # 电影按影片路径登记；电视剧按剧名根目录合并，避免一次入库几十集时创建几十个初始任务。
+        if info.get("media_type") == "tv":
+            task_key = f"initial_tv::{info.get('show_root')}"
+        else:
+            task_key = f"initial::{raw_path}"
+
         with self._lock:
             state = self._load_state()
             queue = state.setdefault("queue", {})
@@ -425,9 +653,15 @@ class LocalMetadataCleaner(_PluginBase):
             if existing:
                 existing["last_webhook_at"] = now_iso
                 existing["duplicate_count"] = int(existing.get("duplicate_count") or 0) + 1
+                episodes = existing.setdefault("episodes", [])
+                ep = str(info.get("episode_strm") or "")
+                if ep and ep not in episodes:
+                    episodes.append(ep)
+                # 保留最早的初次检查时间，不因重复入库事件反复后延。
                 self.save_data("state", state)
                 return {"success": True, "duplicate": True, "message": "重复入库事件已合并", "task": task_key}
-            queue[task_key] = {
+
+            task = {
                 "task_type": "initial",
                 "key": task_key,
                 "raw_path": raw_path,
@@ -438,6 +672,7 @@ class LocalMetadataCleaner(_PluginBase):
                 "movie_dir": info.get("movie_dir"),
                 "scrape_dir": info.get("scrape_dir"),
                 "episode_strm": info.get("episode_strm"),
+                "episodes": [info.get("episode_strm")] if info.get("episode_strm") else [],
                 "first_seen_ts": now_ts,
                 "first_seen": now_iso,
                 "due_ts": now_ts + max(self._initial_check_delay_seconds, 0),
@@ -448,6 +683,9 @@ class LocalMetadataCleaner(_PluginBase):
                 "library_info": lib_info,
                 "last_msg": f"等待 {max(self._initial_check_delay_seconds, 0)} 秒后检查 STRM 库刮削信息"
             }
+            if info.get("media_type") == "tv":
+                task["missing_preview"] = self._build_missing_preview(Path(str(info.get("show_root") or "")), limit=8)
+            queue[task_key] = task
             self.save_data("state", state)
         self._schedule_delayed_check(max(self._initial_check_delay_seconds, 0))
         return {"success": True, "message": "已登记入库任务", "task": task_key, "info": info}
@@ -460,16 +698,18 @@ class LocalMetadataCleaner(_PluginBase):
                 state = self._load_state()
                 queue = state.setdefault("queue", {})
                 now_ts = time.time()
+                if getattr(self, "_next_timer_due_ts", 0) and float(self._next_timer_due_ts) <= now_ts:
+                    self._next_timer_due_ts = 0
                 done = 0
+                changed = False
                 remove_keys: List[str] = []
                 for key, task in list(queue.items()):
                     if not isinstance(task, dict):
                         remove_keys.append(key)
+                        changed = True
                         continue
                     due_ts = float(task.get("due_ts") or 0)
                     if due_ts and now_ts < due_ts:
-                        task["last_check"] = self._now_iso()
-                        task["last_msg"] = f"等待到期：{self._ts_to_str(due_ts)}"
                         continue
 
                     task_type = str(task.get("task_type") or "initial")
@@ -482,13 +722,18 @@ class LocalMetadataCleaner(_PluginBase):
                     else:
                         result = {"success": True, "action": "drop_unknown_task", "scope": key, "folder": key, "message": f"未知任务类型：{task_type}"}
                     task["last_result"] = result
+                    changed = True
                     if result.get("remove", True):
                         remove_keys.append(key)
                         done += 1
                 for key in remove_keys:
                     queue.pop(key, None)
-                self.save_data("state", state)
-                logger.info(f"监控strm刮削网盘：队列检查完成，本次完成 {done} 个任务，剩余 {len(queue)} 个")
+                if changed:
+                    self.save_data("state", state)
+                if done > 0:
+                    logger.info(f"监控strm刮削网盘：队列检查完成，本次完成 {done} 个任务，剩余 {len(queue)} 个")
+                else:
+                    logger.debug(f"监控strm刮削网盘：队列检查完成，本次完成 0 个任务，剩余 {len(queue)} 个")
             except Exception as err:
                 logger.error(f"监控strm刮削网盘：队列检查失败：{err}\n{traceback.format_exc()}")
 
@@ -519,15 +764,47 @@ class LocalMetadataCleaner(_PluginBase):
 
         if media_type == "tv":
             show_root = Path(str(task.get("show_root") or task.get("check_dir") or ""))
-            episode_strm = Path(str(task.get("episode_strm") or task.get("strm_path") or raw_path))
+            episode_values = self._to_list(task.get("episodes") or [])
+            if not episode_values:
+                episode_values = [str(task.get("episode_strm") or task.get("strm_path") or raw_path)]
+            episode_paths: List[Path] = []
+            seen_episode = set()
+            for value in episode_values:
+                ep = Path(str(value or ""))
+                if not str(ep):
+                    continue
+                key = str(ep)
+                if key in seen_episode:
+                    continue
+                seen_episode.add(key)
+                episode_paths.append(ep)
+
             root_status = self._tv_root_metadata_status(show_root)
             if not root_status.get("has_any_metadata"):
                 scrape_dir = Path(self._map_strm_path_to_scrape_path(str(show_root)))
+                markers = state.setdefault("markers", {})
+                marker_key = f"tv_root_whole_scrape::{show_root}"
+                marker = markers.get(marker_key) if isinstance(markers, dict) else None
+                now_ts = time.time()
+                if isinstance(marker, dict) and now_ts - float(marker.get("ts") or 0) < 3600:
+                    self._ensure_tv_recheck_task(state, show_root, reason="root_no_metadata_merged")
+                    return {
+                        "remove": True,
+                        "time": self._now_iso(),
+                        "action": "tv_root_no_metadata_merge_existing_whole_show_scrape",
+                        "scope": str(show_root),
+                        "folder": str(scrape_dir),
+                        "scrape": None,
+                        "scrape_msg": "同一剧名根目录已触发过整剧刮削，本次入库事件已合并，仅保留10天复查任务。",
+                        "skip_history": True,
+                    }
+                if isinstance(markers, dict):
+                    markers[marker_key] = {"ts": now_ts, "time": self._now_iso(), "show_root": str(show_root)}
                 ok, msg = self._trigger_scrape(scrape_dir, overwrite=False)
                 result = {
                     "time": self._now_iso(), "action": "tv_root_no_metadata_scrape_whole_show", "scope": str(show_root), "folder": str(scrape_dir),
                     "scrape": ok, "scrape_msg": msg, "metadata": root_status,
-                    "note": "剧名根目录没有任何图片/nfo，已触发整部剧刮削，并加入10天复查队列。"
+                    "note": f"剧名根目录没有任何图片/nfo，已触发整部剧刮削；本次合并入库 {len(episode_paths)} 集，并加入10天复查队列。"
                 }
                 self._append_history(state, result)
                 if self._notify and not ok:
@@ -535,26 +812,38 @@ class LocalMetadataCleaner(_PluginBase):
                 self._ensure_tv_recheck_task(state, show_root, reason="root_no_metadata")
                 return {"remove": True, **result}
 
-            # 根目录已有刮削信息：只检查本次入库单集。
-            episode_status = self._episode_image_status(episode_strm)
-            if episode_status.get("has_image"):
+            # 根目录已有刮削信息：只检查本次入库的单集列表。
+            missing_eps: List[Path] = []
+            existing_count = 0
+            deleted_total = 0
+            for episode_strm in episode_paths:
+                episode_status = self._episode_image_status(episode_strm)
+                if episode_status.get("has_image"):
+                    existing_count += 1
+                    continue
+                missing_eps.append(episode_strm)
+                deleted = self._delete_episode_nfo(episode_strm)
+                deleted_total += deleted
+                self._ensure_episode_scrape_task(state, episode_strm, show_root, reason="initial_missing_image", deleted_nfo=deleted)
+
+            self._ensure_tv_recheck_task(state, show_root, reason="episode_batch_initial")
+            if missing_eps:
+                names = "、".join([self._episode_label(ep, show_root) for ep in missing_eps[:8]])
                 result = {
-                    "time": self._now_iso(), "action": "tv_episode_image_exists_skip_initial", "scope": str(episode_strm),
-                    "folder": self._map_episode_strm_to_scrape_target(episode_strm), "scrape": None,
-                    "scrape_msg": "本集已有对应 jpg/jpeg/png，跳过立即刮削；整剧已加入10天复查队列。", "metadata": episode_status
+                    "time": self._now_iso(), "action": "tv_episode_missing_image_schedule_scrape", "scope": str(show_root),
+                    "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
+                    "scrape_msg": f"本次合并入库 {len(episode_paths)} 集，其中 {len(missing_eps)} 集缺少对应图片，已删除同名 nfo {deleted_total} 个，{self._episode_scrape_delay_minutes:g} 分钟后逐集刮削。",
+                    "note": names,
+                    "missing_count": len(missing_eps),
+                    "existing_count": existing_count,
                 }
                 self._append_history(state, result)
-                self._ensure_tv_recheck_task(state, show_root, reason="episode_has_image")
                 return {"remove": True, **result}
 
-            deleted = self._delete_episode_nfo(episode_strm)
-            self._ensure_episode_scrape_task(state, episode_strm, show_root, reason="initial_missing_image", deleted_nfo=deleted)
-            self._ensure_tv_recheck_task(state, show_root, reason="episode_missing_image")
             result = {
-                "time": self._now_iso(), "action": "tv_episode_missing_image_schedule_scrape", "scope": str(episode_strm),
-                "folder": self._map_episode_strm_to_scrape_target(episode_strm), "scrape": None,
-                "scrape_msg": f"本集缺少对应图片，已删除同名 nfo {deleted} 个，{self._episode_scrape_delay_minutes:g} 分钟后刮削本集；整剧已加入10天复查队列。",
-                "metadata": episode_status
+                "time": self._now_iso(), "action": "tv_episode_image_exists_skip_initial", "scope": str(show_root),
+                "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
+                "scrape_msg": f"本次合并入库 {len(episode_paths)} 集均已有对应图片，跳过立即刮削；整剧已加入10天复查队列。",
             }
             self._append_history(state, result)
             return {"remove": True, **result}
@@ -645,6 +934,7 @@ class LocalMetadataCleaner(_PluginBase):
                 existing["due_at"] = self._ts_to_str(due_ts)
             existing["duplicate_count"] = int(existing.get("duplicate_count") or 0) + 1
             existing["reason"] = reason or existing.get("reason") or ""
+            existing.setdefault("missing_preview", self._build_missing_preview(show_root, limit=8))
             existing["last_msg"] = f"10天复查任务已合并，复查时间：{existing.get('due_at')}"
             return
         queue[key] = {
@@ -658,14 +948,20 @@ class LocalMetadataCleaner(_PluginBase):
             "due_ts": due_ts,
             "due_at": self._ts_to_str(due_ts),
             "status": "waiting_tv_recheck",
+            "missing_preview": self._build_missing_preview(show_root, limit=8),
             "last_msg": f"等待 {self._tv_recheck_days:g} 天后检查每一集是否都有对应图片"
         }
 
 
     def _schedule_delayed_check(self, delay_seconds: float):
-        """创建一个轻量 Timer，避免必须等到下一次 cron 才处理 10 秒/6 分钟任务。"""
+        """创建轻量 Timer，避免必须等到下一次 cron 才处理 10 秒/6 分钟任务；同一时间段只保留一个。"""
         try:
             delay = max(float(delay_seconds or 0), 0)
+            due_ts = time.time() + delay
+            # 大量剧集同时入库时会创建几十个10秒Timer，这里合并为一个，减少重复队列检查日志。
+            if getattr(self, "_next_timer_due_ts", 0) and abs(float(self._next_timer_due_ts) - due_ts) <= 3:
+                return
+            self._next_timer_due_ts = due_ts
             timer = Timer(delay, self.run_once)
             timer.daemon = True
             timer.start()
@@ -705,22 +1001,37 @@ class LocalMetadataCleaner(_PluginBase):
     def _movie_metadata_status(self, movie_dir: Path) -> Dict[str, Any]:
         files = set()
         nfo_count = 0
+        image_map = {"backdrop": False, "fanart": False, "poster": False}
         try:
             if movie_dir.exists() and movie_dir.is_dir():
                 for item in movie_dir.iterdir():
                     if not item.is_file():
                         continue
                     name = item.name.lower()
+                    stem = item.stem.lower()
+                    suffix = item.suffix.lower()
                     files.add(name)
-                    if item.suffix.lower() == ".nfo":
+                    if suffix == ".nfo":
                         nfo_count += 1
+                    if suffix in self._image_suffixes():
+                        if stem == "backdrop" or stem.startswith("backdrop"):
+                            image_map["backdrop"] = True
+                        if stem == "fanart" or stem.startswith("fanart"):
+                            image_map["fanart"] = True
+                        if stem in {"poster", "folder", "cover"} or stem.startswith("poster"):
+                            image_map["poster"] = True
         except Exception as err:
-            return {"complete": False, "error": str(err), "missing": ["backdrop.jpg", "fanart.jpg", "poster.jpg", "*.nfo"]}
-        required = ["backdrop.jpg", "fanart.jpg", "poster.jpg"]
-        missing = [x for x in required if x not in files]
+            return {"complete": False, "error": str(err), "missing": ["backdrop.*", "fanart.*", "poster/folder/cover.*", "*.nfo"]}
+        missing = []
+        if not image_map["backdrop"]:
+            missing.append("backdrop.*")
+        if not image_map["fanart"]:
+            missing.append("fanart.*")
+        if not image_map["poster"]:
+            missing.append("poster/folder/cover.*")
         if nfo_count <= 0:
             missing.append("*.nfo")
-        return {"complete": not missing, "missing": missing, "nfo_count": nfo_count, "files": sorted(list(files))[:50]}
+        return {"complete": not missing, "missing": missing, "nfo_count": nfo_count, "images": image_map, "files": sorted(list(files))[:50]}
 
     def _tv_root_metadata_status(self, show_root: Path) -> Dict[str, Any]:
         image_count = 0
@@ -794,7 +1105,28 @@ class LocalMetadataCleaner(_PluginBase):
                         missing.append(episode)
         except Exception as err:
             logger.warning(f"监控strm刮削网盘：检查剧集单集图片失败：{show_root} - {err}")
-        return missing
+        return sorted(missing, key=lambda p: str(p))
+
+    def _build_missing_preview(self, show_root: Path, limit: int = 30) -> Dict[str, Any]:
+        try:
+            if not show_root.exists() or not show_root.is_dir():
+                return {"exists": False, "total": 0, "names": []}
+            missing = self._find_missing_episode_images(show_root)
+            names = [self._episode_label(p, show_root) for p in missing[:max(int(limit or 0), 0)]]
+            return {"exists": True, "total": len(missing), "names": names, "truncated": len(missing) > len(names)}
+        except Exception as err:
+            logger.debug(f"监控strm刮削网盘：生成缺图集预览失败：{show_root} - {err}")
+            return {"exists": False, "total": 0, "names": []}
+
+    @staticmethod
+    def _episode_label(episode: Path, show_root: Path = None) -> str:
+        try:
+            if show_root:
+                rel = episode.relative_to(show_root)
+                return str(rel.with_suffix(""))
+        except Exception:
+            pass
+        return episode.stem
 
     def _map_strm_path_to_scrape_path(self, path_text: str) -> str:
         path_text = self._normalise_path_text(path_text)
@@ -914,6 +1246,8 @@ class LocalMetadataCleaner(_PluginBase):
             return True
         # 媒体库列表非常小，24小时自动刷新一次。
         data = self.get_data("library_cache_meta") or {}
+        if isinstance(data, dict) and data.get("server") and data.get("server") != self._media_server:
+            return True
         ts = float(data.get("ts") or 0) if isinstance(data, dict) else 0
         if time.time() - ts > 86400:
             return True
@@ -1128,7 +1462,9 @@ class LocalMetadataCleaner(_PluginBase):
                 meta = {}
             task_type = str(meta.get("task_type") or "")
             due = str(meta.get("due_at") or "")
-            title = f"{key} ｜ {task_type}" + (f" ｜ {due}" if due else "")
+            title = self._queue_title(str(key), meta)
+            if due:
+                title = f"{title} ｜ {due}"
             items.append({"title": title, "value": str(key)})
         return items
 
@@ -1169,52 +1505,50 @@ class LocalMetadataCleaner(_PluginBase):
         data.setdefault("version", 4)
         data.setdefault("queue", {})
         data.setdefault("history", [])
+        data.setdefault("markers", {})
         if not isinstance(data.get("queue"), dict):
             data["queue"] = {}
         if not isinstance(data.get("history"), list):
             data["history"] = []
+        if not isinstance(data.get("markers"), dict):
+            data["markers"] = {}
         return data
 
     def _append_history(self, state: Dict[str, Any], result: Dict[str, Any]):
+        if result.get("skip_history"):
+            return
         history = state.setdefault("history", [])
+        if not isinstance(history, list):
+            history = []
+            state["history"] = history
+        # 去重：同一动作、同一范围、同一刮削目标在短时间内重复出现时，只更新计数，不刷屏。
+        key = self._history_dedupe_key(result)
+        now_ts = time.time()
+        for old in reversed(history[-20:]):
+            if not isinstance(old, dict):
+                continue
+            if old.get("_dedupe_key") != key:
+                continue
+            old_ts = float(old.get("_dedupe_ts") or 0)
+            if old_ts and now_ts - old_ts <= 600:
+                old["time"] = result.get("time") or old.get("time")
+                old["duplicate_count"] = int(old.get("duplicate_count") or 1) + 1
+                old["_dedupe_ts"] = now_ts
+                return
+        result["_dedupe_key"] = key
+        result["_dedupe_ts"] = now_ts
         history.append(result)
         state["history"] = history[-100:]
 
+    @staticmethod
+    def _history_dedupe_key(result: Dict[str, Any]) -> str:
+        return "|".join([
+            str(result.get("action") or ""),
+            str(result.get("scope") or ""),
+            str(result.get("folder") or ""),
+        ])
+
     # --------------------------- 请求、事件、路径工具 ---------------------------
-
-    async def _read_request_payload(self, request: Request) -> Any:
-        try:
-            content_type = str(request.headers.get("content-type", "") or "").lower()
-            if "application/json" in content_type:
-                return await request.json()
-            body = await request.body()
-            if body:
-                try:
-                    return json.loads(body.decode("utf-8", errors="ignore"))
-                except Exception:
-                    return body.decode("utf-8", errors="ignore")
-            return {}
-        except Exception:
-            return {}
-
-    def _check_webhook_auth(self, request: Request, apikey: str = "", token: str = "") -> bool:
-        expected = str(self._webhook_token or "").strip()
-        if not expected:
-            return True
-        got = str(apikey or token or "").strip()
-        if not got:
-            try:
-                got = str(request.query_params.get("apikey") or request.query_params.get("token") or "").strip()
-            except Exception:
-                got = ""
-        return got == expected
-
-    def _extract_event_name(self, payload: Any) -> Tuple[str, bool]:
-        for key in ("event", "Event", "NotificationType", "event_name", "EventName", "type_name"):
-            value = self._get_obj_value(payload, key)
-            if value:
-                return str(value).strip(), True
-        return "", False
 
     def _extract_payload_path(self, payload: Any) -> str:
         value = self._recursive_get_first(payload, ["path", "Path", "ItemPath", "item_path", "file_path", "FileName", "MediaPath"])
@@ -1347,7 +1681,7 @@ class LocalMetadataCleaner(_PluginBase):
 
     @staticmethod
     def _media_suffixes() -> set:
-        return {".mp4", ".mkv", ".ts", ".iso", ".avi", ".rmvb", ".wmv", ".mov", ".m2ts", ".flv", ".mpeg", ".mpg", ".strm"}
+        return {".mp4", ".mkv", ".ts", ".iso", ".avi", ".rmvb", ".wmv", ".mov", ".m2ts", ".flv", ".mpeg", ".mpg"}
 
     def _send_notify(self, result: Dict[str, Any]):
         try:
@@ -1367,28 +1701,22 @@ class LocalMetadataCleaner(_PluginBase):
         except Exception as err:
             logger.error(f"监控strm刮削网盘：发送通知失败：{err}")
 
-    @staticmethod
-    def _queue_text(item: Dict[str, Any]) -> str:
-        return (
-            f"类型：{item.get('task_type', '')}\n"
-            f"状态：{item.get('status', '')}\n"
-            f"入队时间：{item.get('first_seen', '')}\n"
-            f"到期时间：{item.get('due_at', '')}\n"
-            f"STRM：{item.get('strm_path') or item.get('episode_strm') or ''}\n"
-            f"刮削目标：{item.get('scrape_target') or item.get('scrape_dir') or ''}\n"
-            f"说明：{item.get('last_msg', '')}"
-        )
-
-    @staticmethod
-    def _history_text(item: Dict[str, Any]) -> str:
-        return (
-            f"时间：{item.get('time', '')}\n"
-            f"动作：{item.get('action', '')}\n"
-            f"范围：{item.get('scope', '')}\n"
-            f"刮削目标：{item.get('folder', '')}\n"
-            f"刮削：{item.get('scrape_msg', '')}\n"
-            f"说明：{item.get('note', '')}"
-        )
+    def _queue_title(self, key: str, item: Dict[str, Any]) -> str:
+        task_type = str(item.get("task_type") or "")
+        if task_type == "tv_recheck":
+            show_root = Path(str(item.get("show_root") or ""))
+            name = show_root.name or str(show_root)
+            preview = item.get("missing_preview") or {}
+            if preview.get("total", 0) > 0:
+                return f"10天复查：{name}（当前缺图 {preview.get('total')} 集）"
+            return f"10天复查：{name}"
+        if task_type == "episode_scrape":
+            ep = Path(str(item.get("episode_strm") or ""))
+            return f"单集刮削：{ep.stem or key}"
+        if task_type == "initial":
+            ep = Path(str(item.get("episode_strm") or item.get("strm_path") or item.get("raw_path") or ""))
+            return f"入库检查：{ep.stem or key}"
+        return key
 
     def _help_text(self) -> str:
         return (
@@ -1396,11 +1724,11 @@ class LocalMetadataCleaner(_PluginBase):
             "1. 本插件复用 MP 全局 WebhookMessage 入库事件，建议先启用‘媒体库服务器通知’插件；只要它能收到 Emby 新入库，本插件也能监听同一条事件。\n"
             "2. 判断是否刮削完整只看 STRM 库路径，不扫描 CD2：默认 STRM 检查根路径为 /media。\n"
             "3. 需要刮削时，通过 MP 刮削目标根路径触发 MP 刮削，例如 /media/电影/华语电影/片名/xxx.strm → /CD2/115/CMS影库/影视/电影/华语电影/片名。\n"
-            "4. 电影：检查片名目录是否同时存在 backdrop.jpg、fanart.jpg、poster.jpg 和任意 nfo；完整则跳过，不完整则立即刮削一次，不进入后续队列。\n"
+            "4. 电影：检查片名目录是否同时存在 backdrop、fanart、poster/folder/cover 类图片和任意 nfo；完整则跳过，不完整则立即刮削一次，不进入后续队列。\n"
             "5. 电视剧/番剧：定位 STRM 所在剧名根目录。剧名根目录没有任何图片/nfo 时，立即刮削整部剧；已有根目录信息时，只检查入库单集是否有对应图片，缺图则删除该集同名 nfo，等待 6 分钟后刮削该集。\n"
-            "6. 电视剧/番剧每次入库都会合并一个 10 天复查任务；到期后遍历该剧所有 strm，发现缺少对应图片的单集，删除同名 nfo 并等待 6 分钟后逐集刮削。\n"
+            "6. 电视剧/番剧会按剧名根目录合并入库事件，并合并一个 10 天复查任务；到期后遍历该剧所有 strm，发现缺少对应图片的单集，删除同名 nfo 并等待 6 分钟后逐集刮削。\n"
             "7. 媒体库过滤会同时识别路径第一层和第二层，例如 /media/电视剧/国产剧/... 可命中‘电视剧’或‘国产剧’。\n"
-            "8. 队列操作只删除插件里的等待任务，不会删除实际文件；历史记录最多保留最新 100 条，可在配置页清空。"
+            "8. 队列操作只删除插件里的等待任务，不会删除实际文件；清空历史记录只清空页面记录。"
         )
 
     def __update_config(self):
@@ -1413,7 +1741,6 @@ class LocalMetadataCleaner(_PluginBase):
             "all_libraries": self._all_libraries,
             "strm_check_root": self._strm_check_root,
             "scrape_target_root": self._scrape_target_root,
-            "target_depth": self._target_depth,
             "cron": self._cron,
             "initial_check_delay_seconds": self._initial_check_delay_seconds,
             "episode_scrape_delay_minutes": self._episode_scrape_delay_minutes,
@@ -1421,13 +1748,9 @@ class LocalMetadataCleaner(_PluginBase):
             "scrape": self._scrape,
             "overwrite": self._overwrite,
             "clear_history": False,
-            "storage": "local",
-            "webhook_token": self._webhook_token,
             "queue_delete_items": [],
             "queue_delete_confirm": False,
-            "queue_clear_all": False,
-            "emby_strm_root": self._strm_check_root,
-            "cd2_real_root": self._scrape_target_root
+            "queue_clear_all": False
         })
         try:
             self.save_data("library_cache_meta", {"ts": time.time(), "server": self._media_server})

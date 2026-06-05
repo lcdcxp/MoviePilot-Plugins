@@ -17,3 +17,8 @@ https://github.com/你的GitHub用户名/你的仓库名
 ```
 
 注意：MoviePilot 插件市场只读取 GitHub 仓库 main 分支。
+
+
+## 更新记录
+
+- LocalMetadataCleaner v1.1：修复配置布局与队列显示相关问题，优化待处理任务、最近处理记录和页面展示。
