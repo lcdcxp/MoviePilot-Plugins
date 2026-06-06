@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import pytz
 from apscheduler.triggers.cron import CronTrigger
 
+from app import schemas
+from app.core.config import settings
 from app.core.event import eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
@@ -39,12 +41,70 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
     plugin_order = 99
     auth_level = 1
+
+    DEFAULT_STRM_CHECK_ROOT = "/media"
+    DEFAULT_SCRAPE_TARGET_ROOT = "/CD2/115/CMS影库/影视"
+    DEFAULT_CRON = "*/1 * * * *"
+    DEFAULT_INITIAL_CHECK_DELAY_SECONDS = 10
+    DEFAULT_EPISODE_SCRAPE_DELAY_SECONDS = 30
+    DEFAULT_POST_SCRAPE_CHECK_MINUTES = 10
+    DEFAULT_TV_RECHECK_DAYS = 10
+    DEFAULT_TARGET_DEPTH = 3
+    DEFAULT_STORAGE = "local"
+    HISTORY_LIMIT = 100
+
+    STATUS_LABELS = {
+        "waiting_initial_check": "等待入库检查",
+        "waiting_episode_scrape": "等待单集刮削",
+        "waiting_tv_postcheck": "等待刮削后检查",
+        "waiting_tv_recheck": "等待10天复查",
+    }
+    TASK_TYPE_LABELS = {
+        "initial": "入库检查",
+        "episode_scrape": "单集刮削",
+        "tv_postcheck": "刮削后检查",
+        "tv_recheck": "10天复查",
+    }
+    TASK_COLORS = {
+        "initial": "primary",
+        "episode_scrape": "purple",
+        "tv_postcheck": "info",
+        "tv_recheck": "warning",
+    }
+    ACTION_LABELS = {
+        "movie_complete_skip": "电影完整跳过",
+        "movie_incomplete_scrape": "电影补刮削",
+        "tv_root_no_metadata_scrape_whole_show": "整剧刮削",
+        "tv_root_no_metadata_merge_existing_whole_show_scrape": "整剧事件合并",
+        "tv_season_metadata_incomplete_scrape": "季信息补刮削",
+        "tv_season_metadata_merge_existing_scrape": "季信息事件合并",
+        "tv_season_postcheck_incomplete": "季信息检查失败",
+        "tv_season_postcheck_complete": "季信息检查完成",
+        "episode_missing_image_schedule_scrape": "单集缺图",
+        "episode_scrape_done": "单集刮削完成",
+        "episode_scrape_failed": "单集刮削失败",
+        "episode_delayed_scrape": "单集延迟刮削",
+        "tv_episode_missing_image_schedule_scrape": "单集缺图",
+        "tv_episode_image_exists_skip_initial": "单集完整跳过",
+        "tv_postcheck_missing_schedule_recheck": "刮削后缺图",
+        "tv_postcheck_complete": "刮削后完整",
+        "tv_postcheck_show_missing": "刮削后检查失败",
+        "movie_metadata_complete_skip": "电影完整跳过",
+        "movie_metadata_incomplete_scrape": "电影补刮削",
+        "tv_recheck_missing_episodes_schedule_scrape": "10天复查缺图",
+        "tv_recheck_complete": "10天复查完成",
+        "queue_cleared_by_user": "清空队列",
+        "queue_deleted_by_user": "删除任务",
+        "tv_postcheck_manual_missing_keep_waiting": "手动检查仍缺图",
+        "tv_season_postcheck_manual_incomplete_keep_waiting": "季信息手动检查失败",
+        "tv_recheck_manual_missing_keep_waiting": "10天手动复查仍缺图",
+    }
 
     # 基础开关
     _enabled: bool = False
@@ -57,20 +117,21 @@ class LocalMetadataCleaner(_PluginBase):
     _all_libraries: List[Dict[str, Any]] = []
 
     # 路径：检查看 STRM 库，刮削走网盘目标根路径
-    _strm_check_root: str = "/media"
-    _scrape_target_root: str = "/CD2/115/CMS影库/影视"
-    _target_depth: int = 3
+    _strm_check_root: str = DEFAULT_STRM_CHECK_ROOT
+    _scrape_target_root: str = DEFAULT_SCRAPE_TARGET_ROOT
+    _target_depth: int = DEFAULT_TARGET_DEPTH
 
     # 时间配置
-    _cron: str = "*/1 * * * *"
-    _initial_check_delay_seconds: int = 10
-    _episode_scrape_delay_minutes: float = 6
-    _tv_recheck_days: float = 10
+    _cron: str = DEFAULT_CRON
+    _initial_check_delay_seconds: int = DEFAULT_INITIAL_CHECK_DELAY_SECONDS
+    _episode_scrape_delay_seconds: float = DEFAULT_EPISODE_SCRAPE_DELAY_SECONDS
+    _episode_scrape_delay_minutes: float = 0.5  # 兼容旧配置，内部按秒换算
+    _post_scrape_check_delay_minutes: float = DEFAULT_POST_SCRAPE_CHECK_MINUTES
+    _tv_recheck_days: float = DEFAULT_TV_RECHECK_DAYS
 
     # 刮削配置
     _scrape: bool = True
-    _overwrite: bool = False
-    _storage: str = "local"
+    _storage: str = DEFAULT_STORAGE
 
     # 队列操作
     _queue_delete_items: List[str] = []
@@ -108,23 +169,27 @@ class LocalMetadataCleaner(_PluginBase):
             if not isinstance(self._all_libraries, list):
                 self._all_libraries = []
 
-            self._strm_check_root = str(config.get("strm_check_root") or "/media").strip().rstrip("/") or "/media"
-            self._scrape_target_root = str(config.get("scrape_target_root") or "/CD2/115/CMS影库/影视").strip().rstrip("/") or "/CD2/115/CMS影库/影视"
-            self._target_depth = 3
+            self._strm_check_root = str(config.get("strm_check_root") or self.DEFAULT_STRM_CHECK_ROOT).strip().rstrip("/") or self.DEFAULT_STRM_CHECK_ROOT
+            self._scrape_target_root = str(config.get("scrape_target_root") or self.DEFAULT_SCRAPE_TARGET_ROOT).strip().rstrip("/") or self.DEFAULT_SCRAPE_TARGET_ROOT
+            self._target_depth = self.DEFAULT_TARGET_DEPTH
 
-            self._cron = str(config.get("cron") or "*/1 * * * *").strip() or "*/1 * * * *"
-            self._initial_check_delay_seconds = int(self._to_float(config.get("initial_check_delay_seconds"), 10))
-            self._episode_scrape_delay_minutes = self._to_float(config.get("episode_scrape_delay_minutes"), 6)
-            self._tv_recheck_days = self._to_float(config.get("tv_recheck_days"), 10)
+            self._cron = str(config.get("cron") or self.DEFAULT_CRON).strip() or self.DEFAULT_CRON
+            self._initial_check_delay_seconds = int(self._to_float(config.get("initial_check_delay_seconds"), self.DEFAULT_INITIAL_CHECK_DELAY_SECONDS))
+            delay_seconds_value = config.get("episode_scrape_delay_seconds")
+            if delay_seconds_value is None:
+                # 兼容旧版本：旧配置单位是分钟。
+                delay_seconds_value = self._to_float(config.get("episode_scrape_delay_minutes"), self.DEFAULT_EPISODE_SCRAPE_DELAY_SECONDS / 60) * 60
+            self._episode_scrape_delay_seconds = max(self._to_float(delay_seconds_value, self.DEFAULT_EPISODE_SCRAPE_DELAY_SECONDS), 0)
+            self._episode_scrape_delay_minutes = self._episode_scrape_delay_seconds / 60
+            self._post_scrape_check_delay_minutes = self.DEFAULT_POST_SCRAPE_CHECK_MINUTES
+            self._tv_recheck_days = self._to_float(config.get("tv_recheck_days"), self.DEFAULT_TV_RECHECK_DAYS)
             self._scrape = bool(config.get("scrape", True))
-            self._overwrite = bool(config.get("overwrite", False))
-            # 页面不再显示存储标识，普通本地映射固定使用 local
-            self._storage = "local"
+            # 页面不再显示存储标识，普通本地映射固定使用 local。
+            self._storage = self.DEFAULT_STORAGE
 
             self._queue_delete_items = self._to_list(config.get("queue_delete_items") or [])
             self._queue_delete_confirm = bool(config.get("queue_delete_confirm", False))
             self._queue_clear_all = bool(config.get("queue_clear_all", False))
-            self._clear_history = bool(config.get("clear_history", False))
 
         queue_action_done = False
         if self._queue_clear_all:
@@ -145,27 +210,23 @@ class LocalMetadataCleaner(_PluginBase):
             self._queue_delete_confirm = False
             queue_action_done = True
 
-        if self._clear_history:
-            state = self._load_state()
-            old_count = len(state.get("history") or []) if isinstance(state.get("history"), list) else 0
-            state["history"] = []
-            self.save_data("state", state)
-            logger.info(f"监控strm刮削网盘：已清空历史记录，共删除 {old_count} 条")
-            self._clear_history = False
-            queue_action_done = True
-
         if self._media_server and self._library_cache_needs_refresh():
             self._refresh_library_cache()
             self.__update_config()
 
         if self._onlyonce:
-            logger.info("监控strm刮削网盘：立即运行一次")
+            logger.info("监控strm刮削网盘：运行到期任务一次")
             self.run_once()
             self._onlyonce = False
             self.__update_config()
 
         if queue_action_done:
             self.__update_config()
+
+        # 保存配置或 MP 重启后，Timer 会被 stop_service 取消；这里按队列里最近到期任务恢复。
+        # 10 天复查任务按用户要求仍由兜底检查周期处理，不创建长期 Timer。
+        if self._enabled:
+            self._restore_queue_timers()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -175,16 +236,53 @@ class LocalMetadataCleaner(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        return [
+            {
+                "path": "/queue_delete",
+                "endpoint": self.api_delete_queue,
+                "methods": ["GET"],
+                "summary": "删除待处理队列任务"
+            },
+            {
+                "path": "/queue_delete_episode_group",
+                "endpoint": self.api_delete_episode_group,
+                "methods": ["GET"],
+                "summary": "删除同剧单集待刮削任务组"
+            },
+            {
+                "path": "/queue_run",
+                "endpoint": self.api_run_queue,
+                "methods": ["GET"],
+                "summary": "立即执行所选待处理任务"
+            },
+            {
+                "path": "/queue_run_episode_group",
+                "endpoint": self.api_run_episode_group,
+                "methods": ["GET"],
+                "summary": "立即执行同剧单集待刮削任务组"
+            },
+            {
+                "path": "/queue_clear",
+                "endpoint": self.api_clear_queue,
+                "methods": ["GET"],
+                "summary": "清空待处理队列"
+            },
+            {
+                "path": "/history_clear",
+                "endpoint": self.api_clear_history,
+                "methods": ["GET"],
+                "summary": "清空历史记录"
+            }
+        ]
 
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled:
             return []
         try:
-            trigger = CronTrigger.from_crontab(self._cron or "*/1 * * * *")
+            trigger = CronTrigger.from_crontab(self._cron or self.DEFAULT_CRON)
         except Exception as err:
-            logger.error(f"监控strm刮削网盘：cron 表达式错误，使用默认 */1 * * * *：{err}")
-            trigger = CronTrigger.from_crontab("*/1 * * * *")
+            logger.error(f"监控strm刮削网盘：cron 表达式错误，使用默认 {self.DEFAULT_CRON}：{err}")
+            trigger = CronTrigger.from_crontab(self.DEFAULT_CRON)
         return [{
             "id": "LocalMetadataCleaner",
             "name": "监控strm刮削网盘",
@@ -204,14 +302,14 @@ class LocalMetadataCleaner(_PluginBase):
                         "content": [
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "notify", "label": "发送通知"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "onlyonce", "label": "立即运行一次"}}]}
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "onlyonce", "label": "运行到期任务一次"}}]}
                         ]
                     },
                     {
                         "component": "VRow",
                         "content": [
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSelect", "props": {"model": "media_server", "label": "媒体服务器", "items": self._get_media_server_select_items(), "clearable": True}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "cron", "label": "检查周期", "placeholder": "*/1 * * * *"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "cron", "label": "兜底检查周期", "placeholder": self.DEFAULT_CRON}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "initial_check_delay_seconds", "label": "入库后检查延迟秒", "placeholder": "10"}}]}
                         ]
                     },
@@ -224,32 +322,16 @@ class LocalMetadataCleaner(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "strm_check_root", "label": "STRM 检查根路径", "placeholder": "/media"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "scrape_target_root", "label": "MP 刮削目标根路径", "placeholder": "/CD2/115/CMS影库/影视"}}]}
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "strm_check_root", "label": "STRM 检查根路径", "placeholder": self.DEFAULT_STRM_CHECK_ROOT}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "scrape_target_root", "label": "MP 刮削目标根路径", "placeholder": self.DEFAULT_SCRAPE_TARGET_ROOT}}]}
                         ]
                     },
                     {
                         "component": "VRow",
                         "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "episode_scrape_delay_minutes", "label": "单集刮削等待分钟", "placeholder": "6"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "tv_recheck_days", "label": "电视剧复查天数", "placeholder": "10"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "episode_scrape_delay_seconds", "label": "单集刮削等待秒", "placeholder": "30"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "tv_recheck_days", "label": "复查天数", "placeholder": "10"}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "scrape", "label": "触发 MP 刮削"}}]}
-                        ]
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "overwrite", "label": "刮削覆盖模式"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "clear_history", "label": "清空历史记录"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": []}
-                        ]
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [{"component": "VSelect", "props": {"model": "queue_delete_items", "label": "待处理队列操作", "placeholder": "选择要删除的队列任务；保存配置后生效", "items": self._get_queue_select_items(), "multiple": True, "chips": True, "closable-chips": True, "clearable": True}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "queue_delete_confirm", "label": "删除所选任务"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 2}, "content": [{"component": "VSwitch", "props": {"model": "queue_clear_all", "label": "清空全部队列"}}]}
                         ]
                     },
                     {
@@ -268,15 +350,13 @@ class LocalMetadataCleaner(_PluginBase):
             "media_server": "",
             "include_libraries": [],
             "all_libraries": [],
-            "strm_check_root": "/media",
-            "scrape_target_root": "/CD2/115/CMS影库/影视",
-            "cron": "*/1 * * * *",
-            "initial_check_delay_seconds": 10,
-            "episode_scrape_delay_minutes": 6,
-            "tv_recheck_days": 10,
+            "strm_check_root": self.DEFAULT_STRM_CHECK_ROOT,
+            "scrape_target_root": self.DEFAULT_SCRAPE_TARGET_ROOT,
+            "cron": self.DEFAULT_CRON,
+            "initial_check_delay_seconds": self.DEFAULT_INITIAL_CHECK_DELAY_SECONDS,
+            "episode_scrape_delay_seconds": self.DEFAULT_EPISODE_SCRAPE_DELAY_SECONDS,
+            "tv_recheck_days": self.DEFAULT_TV_RECHECK_DAYS,
             "scrape": True,
-            "overwrite": False,
-            "clear_history": False,
             "queue_delete_items": [],
             "queue_delete_confirm": False,
             "queue_clear_all": False
@@ -297,38 +377,7 @@ class LocalMetadataCleaner(_PluginBase):
         last_record = history[-1] if history else {}
 
         cards: List[Dict[str, Any]] = []
-
-        cards.append({
-            "component": "VRow",
-            "props": {"class": "mb-3"},
-            "content": [
-                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                    {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 rounded-lg"}, "content": [
-                        self._card_header("mdi-view-dashboard-outline", "运行概览"),
-                        {"component": "VDivider", "props": {"class": "my-3"}},
-                        {"component": "VRow", "content": [
-                            self._summary_metric("插件状态", "已启用" if self._enabled else "未启用", "success" if self._enabled else "grey"),
-                            self._summary_metric("待处理", f"{queue_count} 个", "info" if queue_count else "success"),
-                            self._summary_metric("10天复查", f"{task_stats.get('tv_recheck', 0)} 个", "warning" if task_stats.get('tv_recheck') else "grey"),
-                            self._summary_metric("单集刮削", f"{task_stats.get('episode_scrape', 0)} 个", "purple" if task_stats.get('episode_scrape') else "grey"),
-                        ]},
-                        {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mt-3", "text": self._overview_text(last_record)}}
-                    ]}
-                ]},
-                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                    {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 rounded-lg"}, "content": [
-                        self._card_header("mdi-folder-sync-outline", "路径与规则"),
-                        {"component": "VDivider", "props": {"class": "my-3"}},
-                        {"component": "VRow", "content": [
-                            self._path_metric("STRM 检查根路径", self._strm_check_root or "/media"),
-                            self._path_metric("MP 刮削目标根路径", self._scrape_target_root or "/CD2/115/CMS影库/影视"),
-                        ]},
-                        {"component": "VAlert", "props": {"type": "success", "variant": "tonal", "density": "compact", "class": "mt-3", "text": "判断是否完整只检查 STRM 库；需要刮削时再把路径映射到 MP 刮削目标。"}}
-                    ]}
-                ]}
-            ]
-        })
-
+        cards.append(self._overview_path_row(queue_count, task_stats, last_record))
         cards.append(self._queue_section(queue, queue_count))
         cards.append(self._history_section(history_display))
 
@@ -340,25 +389,66 @@ class LocalMetadataCleaner(_PluginBase):
 
         return [{"component": "div", "props": {"class": "pa-2"}, "content": cards}]
 
+    def _overview_path_row(self, queue_count: int, task_stats: Dict[str, int], last_record: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "component": "VRow",
+            "props": {"class": "mb-3"},
+            "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [self._overview_card(queue_count, task_stats, last_record)]},
+                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [self._path_rule_card()]}
+            ]
+        }
+
+    def _overview_card(self, queue_count: int, task_stats: Dict[str, int], last_record: Dict[str, Any]) -> Dict[str, Any]:
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 rounded-lg"}, "content": [
+            self._card_header("mdi-view-dashboard-outline", "运行概览"),
+            {"component": "VDivider", "props": {"class": "my-3"}},
+            {"component": "VRow", "content": [
+                self._summary_metric("插件状态", "已启用" if self._enabled else "未启用", "success" if self._enabled else "grey"),
+                self._summary_metric("待处理", f"{queue_count} 个", "info" if queue_count else "success"),
+                self._summary_metric("10天复查", f"{task_stats.get('tv_recheck', 0)} 个", "warning" if task_stats.get('tv_recheck') else "grey"),
+                self._summary_metric("单集刮削", f"{task_stats.get('episode_scrape', 0)} 个", "purple" if task_stats.get('episode_scrape') else "grey"),
+            ]},
+            {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mt-3", "text": self._overview_text(last_record)}}
+        ]}
+
+    def _path_rule_card(self) -> Dict[str, Any]:
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 rounded-lg"}, "content": [
+            self._card_header("mdi-folder-sync-outline", "路径与规则"),
+            {"component": "VDivider", "props": {"class": "my-3"}},
+            {"component": "VRow", "content": [
+                self._path_metric("STRM 检查根路径", self._strm_check_root or self.DEFAULT_STRM_CHECK_ROOT),
+                self._path_metric("MP 刮削目标根路径", self._scrape_target_root or self.DEFAULT_SCRAPE_TARGET_ROOT),
+            ]},
+            {"component": "VAlert", "props": {"type": "success", "variant": "tonal", "density": "compact", "class": "mt-3", "text": "判断是否完整只检查 STRM 库；需要刮削时再把路径映射到 MP 刮削目标。"}}
+        ]}
+
     def _queue_section(self, queue: Dict[str, Any], queue_count: int) -> Dict[str, Any]:
-        queue_items = list(queue.items())[-10:] if queue else []
+        display_items = self._queue_display_items(queue)
+        queue_items = display_items[:10]
         content: List[Dict[str, Any]] = [
-            self._section_title("mdi-timer-sand", f"待处理任务（{queue_count} 个）", "如需删除任务，请到插件设置页的“待处理队列操作”中选择并保存。")
+            self._section_title("mdi-timer-sand", f"待处理任务（{queue_count} 个）", "可单独立即执行；检查类任务若提前执行仍缺图，会保留原到期时间，不会提前加入10天复查。删除操作不删除 STRM、图片、nfo 或网盘文件。")
         ]
         if queue_items:
-            content.append({"component": "VRow", "content": [
-                {"component": "VCol", "props": {"cols": 12}, "content": [self._task_row_card(key, item)]}
-                for key, item in queue_items
+            content.append({"component": "div", "props": {"class": "d-flex justify-end mb-2"}, "content": [
+                {"component": "VBtn", "props": {"variant": "tonal", "color": "error", "size": "small", "prepend-icon": "mdi-delete-sweep"}, "text": "清空队列", "events": {"click": {"api": "plugin/LocalMetadataCleaner/queue_clear", "method": "get", "params": {"apikey": getattr(settings, "API_TOKEN", "")}}}}
             ]})
-            if queue_count > len(queue_items):
-                content.append({"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "density": "compact", "class": "mt-2", "text": f"页面仅显示最新 {len(queue_items)} 个任务，实际队列共有 {queue_count} 个。"}})
+            content.append({"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [self._queue_display_card(display)]}
+                for display in queue_items
+            ]})
+            if len(display_items) > len(queue_items):
+                content.append({"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "density": "compact", "class": "mt-2", "text": f"页面仅显示前 {len(queue_items)} 组任务，实际共有 {len(display_items)} 组、{queue_count} 个任务。"}})
         else:
             content.append({"component": "VAlert", "props": {"type": "success", "variant": "tonal", "density": "compact", "text": "当前没有待处理任务。"}})
         return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 mb-3 rounded-lg"}, "content": content}
 
     def _history_section(self, history_display: List[Dict[str, Any]]) -> Dict[str, Any]:
         content: List[Dict[str, Any]] = [
-            self._section_title("mdi-history", "最近处理记录", "已做展示去重。")
+            self._section_title("mdi-history", "最近处理记录", "已做展示去重。"),
+            {"component": "div", "props": {"class": "d-flex justify-end mb-2"}, "content": [
+                {"component": "VBtn", "props": {"variant": "tonal", "color": "warning", "size": "small", "prepend-icon": "mdi-broom"}, "text": "清空历史记录", "events": {"click": {"api": "plugin/LocalMetadataCleaner/history_clear", "method": "get", "params": {"apikey": getattr(settings, "API_TOKEN", "")}}}}
+            ]}
         ]
         if history_display:
             content.append({"component": "VRow", "content": [
@@ -419,6 +509,102 @@ class LocalMetadataCleaner(_PluginBase):
             stats[task_type] = stats.get(task_type, 0) + 1
         return stats
 
+    def _queue_display_items(self, queue: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """把队列转换成页面展示项。
+
+        实际队列仍保持单集独立任务；这里只把同一部剧、同一状态的单集刮削
+        任务合并成一个页面卡片，避免一次入库多集时详情页过长。
+        """
+        if not isinstance(queue, dict) or not queue:
+            return []
+        sorted_items = sorted(queue.items(), key=lambda kv: float((kv[1] or {}).get("due_ts") or 0))
+        groups: Dict[str, Dict[str, Any]] = {}
+        display: List[Dict[str, Any]] = []
+        for key, item in sorted_items:
+            if not isinstance(item, dict):
+                item = {}
+            task_type = str(item.get("task_type") or "")
+            if task_type == "episode_scrape":
+                show_root = str(item.get("show_root") or "").strip()
+                status = str(item.get("status") or "")
+                group_key = f"episode_group::{show_root}::{status}"
+                group = groups.get(group_key)
+                if not group:
+                    group = {
+                        "display_type": "episode_group",
+                        "group_key": group_key,
+                        "show_root": show_root,
+                        "status": status,
+                        "items": [],
+                        "keys": [],
+                        "due_values": [],
+                        "min_due_ts": float(item.get("due_ts") or 0),
+                    }
+                    groups[group_key] = group
+                    display.append(group)
+                group["items"].append(item)
+                group["keys"].append(str(key))
+                if item.get("due_at"):
+                    group["due_values"].append(str(item.get("due_at")))
+                due_ts = float(item.get("due_ts") or 0)
+                if due_ts and (not group.get("min_due_ts") or due_ts < float(group.get("min_due_ts") or 0)):
+                    group["min_due_ts"] = due_ts
+                continue
+            display.append({"display_type": "single", "key": str(key), "item": item, "min_due_ts": float(item.get("due_ts") or 0)})
+        return sorted(display, key=lambda x: float(x.get("min_due_ts") or 0))
+
+    def _queue_display_card(self, display: Dict[str, Any]) -> Dict[str, Any]:
+        if display.get("display_type") == "episode_group":
+            return self._episode_group_card(display)
+        return self._task_row_card(str(display.get("key") or ""), display.get("item") or {})
+
+    def _episode_group_card(self, group: Dict[str, Any]) -> Dict[str, Any]:
+        items = [x for x in (group.get("items") or []) if isinstance(x, dict)]
+        show_root = Path(str(group.get("show_root") or ""))
+        show_name = show_root.name or str(show_root) or "同剧单集"
+        status = str(group.get("status") or "")
+        due_values = sorted(set([str(x) for x in (group.get("due_values") or []) if str(x or "").strip()]))
+        due_text = due_values[0] if len(due_values) == 1 else (f"{due_values[0]} 等" if due_values else "")
+        title = f"单集刮削：{show_name}（{len(items)} 集）"
+        chips = [self._chip("单集刮削", "purple")]
+        if status:
+            chips.append(self._chip(self._status_label(status), "grey"))
+        if due_text:
+            chips.append(self._chip(f"到期 {due_text}", "info"))
+        if len(due_values) > 1:
+            chips.append(self._chip("到期时间不同", "warning"))
+
+        episode_labels = []
+        for item in items:
+            ep = Path(str(item.get("episode_strm") or ""))
+            if ep:
+                episode_labels.append(self._episode_label(ep, show_root))
+        episode_labels = episode_labels[:12]
+
+        target = str(items[0].get("scrape_target") or "") if items else ""
+        detail_lines: List[Dict[str, Any]] = []
+        if show_root:
+            detail_lines.append(self._mini_line("剧名目录", self._short_path(str(show_root))))
+        if target:
+            detail_lines.append(self._mini_line("刮削目标示例", self._short_path(target)))
+        if episode_labels:
+            detail_lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"}, "text": "待刮削集："})
+            detail_lines.append({"component": "div", "props": {"class": "d-flex flex-wrap ga-1 mt-1"}, "content": [self._chip(str(name), "purple") for name in episode_labels]})
+            if len(items) > len(episode_labels):
+                detail_lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": f"仅展示前 {len(episode_labels)} 集，其余 {len(items) - len(episode_labels)} 集仍会按队列处理。"})
+        detail_lines.append(self._mini_line("说明", "页面合并展示；底层仍按单集逐个刮削。"))
+
+        return {"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 rounded-lg"}, "content": [
+            {"component": "div", "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-2"}, "content": [
+                {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium"}, "text": title},
+                {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-1"}, "content": chips + [
+                    {"component": "VBtn", "props": {"variant": "tonal", "color": "success", "size": "x-small", "prepend-icon": "mdi-play-circle-outline", "class": "ml-1"}, "text": "立即执行整组", "events": {"click": {"api": "plugin/LocalMetadataCleaner/queue_run_episode_group", "method": "get", "params": {"show_root": str(show_root), "status": status, "apikey": getattr(settings, "API_TOKEN", "")}}}},
+                    {"component": "VBtn", "props": {"variant": "tonal", "color": "error", "size": "x-small", "prepend-icon": "mdi-delete-outline", "class": "ml-1"}, "text": "删除整组", "events": {"click": {"api": "plugin/LocalMetadataCleaner/queue_delete_episode_group", "method": "get", "params": {"show_root": str(show_root), "status": status, "apikey": getattr(settings, "API_TOKEN", "")}}}}
+                ]}
+            ]},
+            {"component": "div", "props": {"class": "mt-2"}, "content": detail_lines}
+        ]}
+
     def _task_row_card(self, key: str, item: Dict[str, Any]) -> Dict[str, Any]:
         task_type = str(item.get("task_type") or "")
         title = self._queue_title(key, item)
@@ -428,7 +614,7 @@ class LocalMetadataCleaner(_PluginBase):
         target = str(item.get("scrape_target") or item.get("scrape_dir") or "")
         chips = [self._chip(self._task_type_label(task_type), self._task_color(task_type))]
         if status:
-            chips.append(self._chip(status, "grey"))
+            chips.append(self._chip(self._status_label(status), "grey"))
         if due_at:
             chips.append(self._chip(f"到期 {due_at}", "info"))
 
@@ -437,6 +623,25 @@ class LocalMetadataCleaner(_PluginBase):
             detail_lines.append(self._mini_line("STRM", self._short_path(strm)))
         if target:
             detail_lines.append(self._mini_line("刮削目标", self._short_path(target)))
+
+        if task_type == "tv_postcheck":
+            mode = str(item.get("mode") or "")
+            if mode:
+                mode_label = "整部剧" if mode == "show" else ("季信息" if mode == "season" else "入库单集")
+                detail_lines.append(self._mini_line("检查范围", mode_label))
+            season_dirs = self._to_list(item.get("season_dirs") or [])
+            if season_dirs:
+                names = [Path(sd).name or str(sd) for sd in season_dirs[:8]]
+                detail_lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"}, "text": "待检查季："})
+                detail_lines.append({"component": "div", "props": {"class": "d-flex flex-wrap ga-1 mt-1"}, "content": [self._chip(str(name), "info") for name in names]})
+            episodes = self._to_list(item.get("episodes") or [])
+            if episodes:
+                show_root = Path(str(item.get("show_root") or ""))
+                names = [self._episode_label(Path(ep), show_root) for ep in episodes[:8]]
+                detail_lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"}, "text": "待检查集："})
+                detail_lines.append({"component": "div", "props": {"class": "d-flex flex-wrap ga-1 mt-1"}, "content": [self._chip(str(name), "info") for name in names]})
+                if len(episodes) > 8:
+                    detail_lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": "仅展示前 8 集。"})
 
         if task_type == "tv_recheck":
             preview = item.get("missing_preview") or {}
@@ -464,7 +669,10 @@ class LocalMetadataCleaner(_PluginBase):
         return {"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 rounded-lg"}, "content": [
             {"component": "div", "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-2"}, "content": [
                 {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium"}, "text": title},
-                {"component": "div", "props": {"class": "d-flex flex-wrap ga-1"}, "content": chips}
+                {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-1"}, "content": chips + [
+                    {"component": "VBtn", "props": {"variant": "tonal", "color": "success" if task_type not in ("tv_postcheck", "tv_recheck") else "info", "size": "x-small", "prepend-icon": "mdi-play-circle-outline", "class": "ml-1"}, "text": "立即检查" if task_type in ("tv_postcheck", "tv_recheck") else "立即执行", "events": {"click": {"api": "plugin/LocalMetadataCleaner/queue_run", "method": "get", "params": {"key": key, "apikey": getattr(settings, "API_TOKEN", "")}}}},
+                    {"component": "VBtn", "props": {"variant": "tonal", "color": "error", "size": "x-small", "prepend-icon": "mdi-delete-outline", "class": "ml-1"}, "text": "删除任务", "events": {"click": {"api": "plugin/LocalMetadataCleaner/queue_delete", "method": "get", "params": {"key": key, "apikey": getattr(settings, "API_TOKEN", "")}}}}
+                ]}
             ]},
             {"component": "div", "props": {"class": "mt-2"}, "content": detail_lines}
         ]}
@@ -491,6 +699,7 @@ class LocalMetadataCleaner(_PluginBase):
         note = str(item.get("note") or "")
         if note:
             detail_lines.append(self._mini_line("说明", note))
+        detail_lines.extend(self._history_episode_lines(item))
         dup = int(item.get("duplicate_count") or 0)
         if dup > 1:
             detail_lines.append(self._mini_line("重复合并", f"{dup} 次"))
@@ -517,43 +726,92 @@ class LocalMetadataCleaner(_PluginBase):
             {"component": "span", "text": value}
         ]}
 
-    @staticmethod
-    def _task_type_label(task_type: str) -> str:
-        return {
-            "initial": "入库检查",
-            "episode_scrape": "单集刮削",
-            "tv_recheck": "10天复查",
-        }.get(task_type, task_type or "任务")
+    def _history_episode_lines(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """历史记录里展示具体集数，避免只看到“检查 X 集”但不知道是哪几集。"""
+        if not isinstance(item, dict):
+            return []
 
-    @staticmethod
-    def _task_color(task_type: str) -> str:
-        return {
-            "initial": "primary",
-            "episode_scrape": "purple",
-            "tv_recheck": "warning",
-        }.get(task_type, "grey")
+        groups = [
+            ("missing", "缺图集", "warning"),
+            ("checked", "检查集", "info"),
+            ("scraped", "刮削集", "purple"),
+        ]
+        for prefix, label, color in groups:
+            labels = self._history_episode_labels(item, prefix, limit=12)
+            total = int(item.get(f"{prefix}_episode_total") or len(labels) or 0)
+            if not labels:
+                continue
+            title = label if total <= len(labels) else f"{label}（前 {len(labels)} / 共 {total} 集）"
+            lines: List[Dict[str, Any]] = [
+                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"}, "text": f"{title}："},
+                {"component": "div", "props": {"class": "d-flex flex-wrap ga-1 mt-1"}, "content": [self._chip(str(name), color) for name in labels]},
+            ]
+            if total > len(labels):
+                lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": f"仅展示前 {len(labels)} 集。"})
+            return lines
 
-    @staticmethod
-    def _action_label(action: str) -> str:
-        mapping = {
-            "movie_complete_skip": "电影完整跳过",
-            "movie_incomplete_scrape": "电影补刮削",
-            "tv_root_no_metadata_scrape_whole_show": "整剧刮削",
-            "tv_root_no_metadata_merge_existing_whole_show_scrape": "整剧事件合并",
-            "episode_missing_image_schedule_scrape": "单集缺图",
-            "episode_scrape_done": "单集刮削完成",
-            "episode_scrape_failed": "单集刮削失败",
-            "episode_delayed_scrape": "单集延迟刮削",
-            "tv_episode_missing_image_schedule_scrape": "单集缺图",
-            "tv_episode_image_exists_skip_initial": "单集完整跳过",
-            "movie_metadata_complete_skip": "电影完整跳过",
-            "movie_metadata_incomplete_scrape": "电影补刮削",
-            "tv_recheck_missing_episodes_schedule_scrape": "10天复查缺图",
-            "tv_recheck_complete": "10天复查完成",
-            "queue_cleared_by_user": "清空队列",
-            "queue_deleted_by_user": "删除任务",
+        # 兼容旧历史：旧版本没有保存具体集数。只有当当前目录 STRM 总数与记录里的“检查 X 集”一致时，才推断展示，避免误导。
+        inferred = self._infer_history_checked_episode_labels(item, limit=12)
+        if inferred:
+            total, labels = inferred
+            title = "检查集（按当前目录推断）" if total <= len(labels) else f"检查集（按当前目录推断，前 {len(labels)} / 共 {total} 集）"
+            return [
+                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"}, "text": f"{title}："},
+                {"component": "div", "props": {"class": "d-flex flex-wrap ga-1 mt-1"}, "content": [self._chip(str(name), "info") for name in labels]},
+            ]
+        return []
+
+    def _history_episode_labels(self, item: Dict[str, Any], prefix: str, limit: int = 12) -> List[str]:
+        labels = self._to_list(item.get(f"{prefix}_episode_labels") or [])
+        if labels:
+            return labels[:max(int(limit or 0), 0)]
+        show_root = Path(str(item.get("scope") or ""))
+        paths = self._unique_episode_paths(item.get(f"{prefix}_episodes") or [])
+        if paths:
+            return [self._episode_label(ep, show_root) for ep in paths[:max(int(limit or 0), 0)]]
+        return []
+
+    def _infer_history_checked_episode_labels(self, item: Dict[str, Any], limit: int = 12) -> Optional[Tuple[int, List[str]]]:
+        action = str(item.get("action") or "")
+        if action not in {"tv_postcheck_complete", "tv_recheck_complete"}:
+            return None
+        msg = str(item.get("scrape_msg") or "")
+        match = re.search(r"检查\s*(\d+)\s*集", msg)
+        if not match:
+            return None
+        checked_count = int(match.group(1) or 0)
+        if checked_count <= 0 or checked_count > 50:
+            return None
+        show_root = Path(str(item.get("scope") or ""))
+        if not show_root.exists() or not show_root.is_dir():
+            return None
+        episodes = self._list_strm_files(show_root)
+        if len(episodes) != checked_count:
+            return None
+        take = max(int(limit or 0), 0)
+        return len(episodes), [self._episode_label(ep, show_root) for ep in episodes[:take]]
+
+    def _episode_history_payload(self, show_root: Path, episodes: Any, prefix: str = "checked", limit: int = 20) -> Dict[str, Any]:
+        eps = self._unique_episode_paths(episodes)
+        take = max(int(limit or 0), 0)
+        return {
+            f"{prefix}_episodes": [str(ep) for ep in eps[:take]],
+            f"{prefix}_episode_labels": [self._episode_label(ep, show_root) for ep in eps[:take]],
+            f"{prefix}_episode_total": len(eps),
+            f"{prefix}_episode_truncated": len(eps) > take,
         }
-        return mapping.get(action, action or "记录")
+
+    def _status_label(self, status: str) -> str:
+        return self.STATUS_LABELS.get(status, status or "等待中")
+
+    def _task_type_label(self, task_type: str) -> str:
+        return self.TASK_TYPE_LABELS.get(task_type, task_type or "任务")
+
+    def _task_color(self, task_type: str) -> str:
+        return self.TASK_COLORS.get(task_type, "grey")
+
+    def _action_label(self, action: str) -> str:
+        return self.ACTION_LABELS.get(action, action or "记录")
 
     @staticmethod
     def _short_path(path_text: str, max_len: int = 86) -> str:
@@ -607,12 +865,8 @@ class LocalMetadataCleaner(_PluginBase):
             if event_name and not self._is_item_added_event(event_name):
                 return
             channel = str(self._get_obj_value(event_info, "channel") or payload.get("channel") or "").strip().lower()
-            source = str(self._get_obj_value(event_info, "source") or payload.get("source") or "").strip().lower()
             if channel and channel not in {"emby", ""}:
                 return
-            if source and "emby" not in source and source not in {"media_server", "mediaserver", ""}:
-                # 不强拦截 source，避免不同 MP 版本字段不同；仅排除明显非 Emby 源。
-                pass
 
             raw_path = self._event_info_path(event_info, payload)
             if not raw_path:
@@ -631,14 +885,14 @@ class LocalMetadataCleaner(_PluginBase):
             elif result.get("success") and not result.get("ignored"):
                 logger.info(f"监控strm刮削网盘：已通过 MP 全局 Webhook 事件登记任务：{result.get('task')}")
             else:
-                logger.info(f"监控strm刮削网盘：MP 全局 Webhook 事件未登记任务：{result}")
+                logger.debug(f"监控strm刮削网盘：MP 全局 Webhook 事件未登记任务：{result}")
         except Exception as err:
             logger.error(f"监控strm刮削网盘：处理 MP 全局 Webhook 事件失败：{err}\n{traceback.format_exc()}")
 
     def _register_incoming_path(self, payload: Any, raw_path: str, event_name: str = "", source: str = "") -> Dict[str, Any]:
         lib_allowed, lib_msg, lib_info = self._library_allowed(payload, raw_path)
         if not lib_allowed:
-            logger.info(f"监控strm刮削网盘：媒体库过滤忽略：{lib_msg}，路径：{raw_path}")
+            logger.debug(f"监控strm刮削网盘：媒体库过滤忽略：{lib_msg}，路径：{raw_path}")
             return {"success": True, "ignored": True, "message": lib_msg, "library_info": lib_info}
 
         raw_path = self._normalise_path_text(raw_path)
@@ -649,9 +903,14 @@ class LocalMetadataCleaner(_PluginBase):
         now_ts = time.time()
         now_iso = self._now_iso()
 
-        # 电影按影片路径登记；电视剧按剧名根目录合并，避免一次入库几十集时创建几十个初始任务。
+        # 电影按影片路径登记；电视剧按“剧名目录 + 季目录”合并。
+        # 这样先入第一季、后入第二季时，第一季的刮削后检查不会重新扫描整部剧而把第二季一起算进去。
+        season_scope = ""
         if info.get("media_type") == "tv":
-            task_key = f"initial_tv::{info.get('show_root')}"
+            show_root_path = Path(str(info.get("show_root") or ""))
+            episode_path = Path(str(info.get("episode_strm") or raw_path))
+            season_scope = str(self._tv_episode_season_scope(show_root_path, episode_path))
+            task_key = f"initial_tv::{info.get('show_root')}::{season_scope}"
         else:
             task_key = f"initial::{raw_path}"
 
@@ -666,8 +925,11 @@ class LocalMetadataCleaner(_PluginBase):
                 ep = str(info.get("episode_strm") or "")
                 if ep and ep not in episodes:
                     episodes.append(ep)
+                if info.get("media_type") == "tv":
+                    existing["missing_preview"] = self._preview_from_episodes(Path(str(info.get("show_root") or "")), episodes, limit=8)
                 # 保留最早的初次检查时间，不因重复入库事件反复后延。
                 self.save_data("state", state)
+                self._restore_queue_timers(state)
                 return {"success": True, "duplicate": True, "message": "重复入库事件已合并", "task": task_key}
 
             task = {
@@ -678,6 +940,7 @@ class LocalMetadataCleaner(_PluginBase):
                 "strm_path": info.get("strm_path"),
                 "check_dir": info.get("check_dir"),
                 "show_root": info.get("show_root"),
+                "season_scope": season_scope,
                 "movie_dir": info.get("movie_dir"),
                 "scrape_dir": info.get("scrape_dir"),
                 "episode_strm": info.get("episode_strm"),
@@ -693,11 +956,24 @@ class LocalMetadataCleaner(_PluginBase):
                 "last_msg": f"等待 {max(self._initial_check_delay_seconds, 0)} 秒后检查 STRM 库刮削信息"
             }
             if info.get("media_type") == "tv":
-                task["missing_preview"] = self._build_missing_preview(Path(str(info.get("show_root") or "")), limit=8)
+                # 初始任务只展示本次季/批次的入库集数，不再用整部剧缺图缓存误导。
+                task["missing_preview"] = self._preview_from_episodes(Path(str(info.get("show_root") or "")), task.get("episodes") or [], limit=8)
             queue[task_key] = task
             self.save_data("state", state)
         self._schedule_delayed_check(max(self._initial_check_delay_seconds, 0))
         return {"success": True, "message": "已登记入库任务", "task": task_key, "info": info}
+
+    def _process_queue_task(self, key: str, task: Dict[str, Any], state: Dict[str, Any], manual: bool = False) -> Dict[str, Any]:
+        task_type = str(task.get("task_type") or "initial")
+        if task_type == "initial":
+            return self._process_initial_task(task, state)
+        if task_type == "episode_scrape":
+            return self._process_episode_scrape_task(task, state)
+        if task_type == "tv_postcheck":
+            return self._process_tv_postcheck_task(task, state, manual=manual)
+        if task_type == "tv_recheck":
+            return self._process_tv_recheck_task(task, state, manual=manual)
+        return {"success": True, "action": "drop_unknown_task", "scope": key, "folder": key, "message": f"未知任务类型：{task_type}"}
 
     def run_once(self):
         if not self._enabled:
@@ -713,6 +989,10 @@ class LocalMetadataCleaner(_PluginBase):
                 changed = False
                 remove_keys: List[str] = []
                 for key, task in list(queue.items()):
+                    # 队列处理过程中，前面的任务可能已经同步删除了后面的旧复查任务；
+                    # 快照里的陈旧对象必须跳过，避免已经清理的 10 天复查又被执行。
+                    if queue.get(key) is not task:
+                        continue
                     if not isinstance(task, dict):
                         remove_keys.append(key)
                         changed = True
@@ -721,15 +1001,7 @@ class LocalMetadataCleaner(_PluginBase):
                     if due_ts and now_ts < due_ts:
                         continue
 
-                    task_type = str(task.get("task_type") or "initial")
-                    if task_type == "initial":
-                        result = self._process_initial_task(task, state)
-                    elif task_type == "episode_scrape":
-                        result = self._process_episode_scrape_task(task, state)
-                    elif task_type == "tv_recheck":
-                        result = self._process_tv_recheck_task(task, state)
-                    else:
-                        result = {"success": True, "action": "drop_unknown_task", "scope": key, "folder": key, "message": f"未知任务类型：{task_type}"}
+                    result = self._process_queue_task(key, task, state, manual=False)
                     task["last_result"] = result
                     changed = True
                     if result.get("remove", True):
@@ -743,6 +1015,8 @@ class LocalMetadataCleaner(_PluginBase):
                     logger.info(f"监控strm刮削网盘：队列检查完成，本次完成 {done} 个任务，剩余 {len(queue)} 个")
                 else:
                     logger.debug(f"监控strm刮削网盘：队列检查完成，本次完成 0 个任务，剩余 {len(queue)} 个")
+                # 本轮处理结束后，重新安排最近一个短期到期任务，避免只依赖兜底检查周期。
+                self._restore_queue_timers(state)
             except Exception as err:
                 logger.error(f"监控strm刮削网盘：队列检查失败：{err}\n{traceback.format_exc()}")
 
@@ -760,7 +1034,7 @@ class LocalMetadataCleaner(_PluginBase):
                 }
                 self._append_history(state, result)
                 return {"remove": True, **result}
-            ok, msg = self._trigger_scrape(scrape_dir, overwrite=False)
+            ok, msg = self._trigger_scrape(scrape_dir)
             result = {
                 "time": self._now_iso(), "action": "movie_metadata_incomplete_scrape", "scope": str(movie_dir), "folder": str(scrape_dir),
                 "scrape": ok, "scrape_msg": msg, "metadata": status,
@@ -776,17 +1050,7 @@ class LocalMetadataCleaner(_PluginBase):
             episode_values = self._to_list(task.get("episodes") or [])
             if not episode_values:
                 episode_values = [str(task.get("episode_strm") or task.get("strm_path") or raw_path)]
-            episode_paths: List[Path] = []
-            seen_episode = set()
-            for value in episode_values:
-                ep = Path(str(value or ""))
-                if not str(ep):
-                    continue
-                key = str(ep)
-                if key in seen_episode:
-                    continue
-                seen_episode.add(key)
-                episode_paths.append(ep)
+            episode_paths = self._unique_episode_paths(episode_values)
 
             root_status = self._tv_root_metadata_status(show_root)
             if not root_status.get("has_any_metadata"):
@@ -795,8 +1059,17 @@ class LocalMetadataCleaner(_PluginBase):
                 marker_key = f"tv_root_whole_scrape::{show_root}"
                 marker = markers.get(marker_key) if isinstance(markers, dict) else None
                 now_ts = time.time()
-                if isinstance(marker, dict) and now_ts - float(marker.get("ts") or 0) < 3600:
-                    self._ensure_tv_recheck_task(state, show_root, reason="root_no_metadata_merged")
+                if isinstance(marker, dict) and now_ts - float(marker.get("ts") or 0) < 600:
+                    marker_ts = float(marker.get("ts") or now_ts)
+                    self._ensure_tv_postcheck_task(
+                        state,
+                        show_root,
+                        mode="episodes",
+                        episodes=episode_paths,
+                        reason="root_no_metadata_merged",
+                        batch_id=str(task.get("key") or self._make_task_batch_id("rootcheck")),
+                        due_ts=marker_ts + max(self._post_scrape_check_delay_minutes, 0) * 60,
+                    )
                     return {
                         "remove": True,
                         "time": self._now_iso(),
@@ -804,27 +1077,94 @@ class LocalMetadataCleaner(_PluginBase):
                         "scope": str(show_root),
                         "folder": str(scrape_dir),
                         "scrape": None,
-                        "scrape_msg": "同一剧名根目录已触发过整剧刮削，本次入库事件已合并，仅保留10天复查任务。",
+                        "scrape_msg": "同一剧名根目录 10 分钟内已成功触发过整剧刮削，本次入库事件已合并；按首次刮削成功时间 10 分钟后检查缺图集。",
                         "skip_history": True,
                     }
-                if isinstance(markers, dict):
+                ok, msg = self._trigger_scrape(scrape_dir)
+                if ok and isinstance(markers, dict):
+                    # 只有成功发出 MP 刮削事件后才写入去重标记，避免失败后重新入库被误判为已刮削。
                     markers[marker_key] = {"ts": now_ts, "time": self._now_iso(), "show_root": str(show_root)}
-                ok, msg = self._trigger_scrape(scrape_dir, overwrite=False)
                 result = {
                     "time": self._now_iso(), "action": "tv_root_no_metadata_scrape_whole_show", "scope": str(show_root), "folder": str(scrape_dir),
                     "scrape": ok, "scrape_msg": msg, "metadata": root_status,
-                    "note": f"剧名根目录没有任何图片/nfo，已触发整部剧刮削；本次合并入库 {len(episode_paths)} 集，并加入10天复查队列。"
+                    "note": (
+                        f"剧名根目录没有任何图片/nfo，已触发整部剧刮削；本次入库范围固定为当前季/当前批次 {len(episode_paths)} 集，后续只检查这批集数，缺图集再加入 10 天复查队列。"
+                        if ok else
+                        "剧名根目录没有任何图片/nfo，但整部剧刮削触发失败；未写入去重标记，后续重新入库或立即运行可再次尝试。"
+                    ),
+                    **self._episode_history_payload(show_root, episode_paths, prefix="checked"),
                 }
                 self._append_history(state, result)
                 if self._notify and not ok:
                     self._send_notify(result)
-                self._ensure_tv_recheck_task(state, show_root, reason="root_no_metadata")
+                if ok:
+                    self._ensure_tv_postcheck_task(
+                        state,
+                        show_root,
+                        mode="episodes",
+                        episodes=episode_paths,
+                        reason="after_whole_show_scrape",
+                        batch_id=str(task.get("key") or self._make_task_batch_id("rootcheck")),
+                        due_ts=now_ts + max(self._post_scrape_check_delay_minutes, 0) * 60,
+                    )
                 return {"remove": True, **result}
 
-            # 根目录已有刮削信息：只检查本次入库的单集列表。
+            # 根目录已有刮削信息：如果当前季缺少季信息，先补刮削当前季；随后仍按单集逻辑检查本次入库集。
+            season_dirs = self._unique_season_dirs(episode_paths, show_root)
+            for season_dir in season_dirs:
+                season_status = self._tv_season_metadata_status(show_root, season_dir)
+                if season_status.get("complete"):
+                    continue
+                scrape_dir = Path(self._map_strm_path_to_scrape_path(str(season_dir)))
+                markers = state.setdefault("markers", {})
+                marker_key = f"tv_season_scrape::{season_dir}"
+                marker = markers.get(marker_key) if isinstance(markers, dict) else None
+                now_ts = time.time()
+                if isinstance(marker, dict) and now_ts - float(marker.get("ts") or 0) < 600:
+                    marker_ts = float(marker.get("ts") or now_ts)
+                    self._ensure_tv_postcheck_task(
+                        state,
+                        show_root,
+                        mode="season",
+                        season_dirs=[season_dir],
+                        reason="season_metadata_merged",
+                        batch_id=f"season_{season_dir.name}",
+                        due_ts=marker_ts + max(self._post_scrape_check_delay_minutes, 0) * 60,
+                    )
+                    logger.debug(f"监控strm刮削网盘：同一季信息刮削事件已合并：{season_dir}")
+                    continue
+
+                ok, msg = self._trigger_scrape(scrape_dir)
+                if ok and isinstance(markers, dict):
+                    markers[marker_key] = {"ts": now_ts, "time": self._now_iso(), "season_dir": str(season_dir)}
+                season_result = {
+                    "time": self._now_iso(),
+                    "action": "tv_season_metadata_incomplete_scrape",
+                    "scope": str(season_dir),
+                    "folder": str(scrape_dir),
+                    "scrape": ok,
+                    "scrape_msg": msg,
+                    "metadata": season_status,
+                    "note": "当前季缺少季信息，已触发当前季目录刮削；随后继续检查本次入库单集图片。" if ok else "当前季缺少季信息，但季目录刮削触发失败。",
+                }
+                self._append_history(state, season_result)
+                if self._notify and not ok:
+                    self._send_notify(season_result)
+                if ok:
+                    self._ensure_tv_postcheck_task(
+                        state,
+                        show_root,
+                        mode="season",
+                        season_dirs=[season_dir],
+                        reason="after_season_scrape",
+                        batch_id=f"season_{season_dir.name}",
+                        due_ts=now_ts + max(self._post_scrape_check_delay_minutes, 0) * 60,
+                    )
+
             missing_eps: List[Path] = []
             existing_count = 0
             deleted_total = 0
+            postcheck_batch_id = self._make_task_batch_id("postcheck")
             for episode_strm in episode_paths:
                 episode_status = self._episode_image_status(episode_strm)
                 if episode_status.get("has_image"):
@@ -833,18 +1173,26 @@ class LocalMetadataCleaner(_PluginBase):
                 missing_eps.append(episode_strm)
                 deleted = self._delete_episode_nfo(episode_strm)
                 deleted_total += deleted
-                self._ensure_episode_scrape_task(state, episode_strm, show_root, reason="initial_missing_image", deleted_nfo=deleted)
+                self._ensure_episode_scrape_task(
+                    state,
+                    episode_strm,
+                    show_root,
+                    reason="initial_missing_image",
+                    deleted_nfo=deleted,
+                    postcheck_batch_id=postcheck_batch_id,
+                )
 
-            self._ensure_tv_recheck_task(state, show_root, reason="episode_batch_initial")
             if missing_eps:
                 names = "、".join([self._episode_label(ep, show_root) for ep in missing_eps[:8]])
                 result = {
                     "time": self._now_iso(), "action": "tv_episode_missing_image_schedule_scrape", "scope": str(show_root),
                     "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
-                    "scrape_msg": f"本次合并入库 {len(episode_paths)} 集，其中 {len(missing_eps)} 集缺少对应图片，已删除同名 nfo {deleted_total} 个，{self._episode_scrape_delay_minutes:g} 分钟后逐集刮削。",
+                    "scrape_msg": f"本次合并入库 {len(episode_paths)} 集，其中 {len(missing_eps)} 集缺少对应图片，已删除同名 nfo {deleted_total} 个，{self._episode_scrape_delay_seconds:g} 秒后逐集刮削；单集刮削事件发送成功后再计时 10 分钟检查，仍缺图才加入 10 天复查。",
                     "note": names,
                     "missing_count": len(missing_eps),
                     "existing_count": existing_count,
+                    **self._episode_history_payload(show_root, episode_paths, prefix="checked"),
+                    **self._episode_history_payload(show_root, missing_eps, prefix="missing"),
                 }
                 self._append_history(state, result)
                 return {"remove": True, **result}
@@ -852,7 +1200,8 @@ class LocalMetadataCleaner(_PluginBase):
             result = {
                 "time": self._now_iso(), "action": "tv_episode_image_exists_skip_initial", "scope": str(show_root),
                 "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
-                "scrape_msg": f"本次合并入库 {len(episode_paths)} 集均已有对应图片，跳过立即刮削；整剧已加入10天复查队列。",
+                "scrape_msg": f"本次合并入库 {len(episode_paths)} 集均已有对应图片，跳过刮削；不加入 10 天复查队列。",
+                **self._episode_history_payload(show_root, episode_paths, prefix="checked"),
             }
             self._append_history(state, result)
             return {"remove": True, **result}
@@ -863,56 +1212,266 @@ class LocalMetadataCleaner(_PluginBase):
 
     def _process_episode_scrape_task(self, task: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
         episode_strm = Path(str(task.get("episode_strm") or ""))
-        target = task.get("scrape_target") or self._map_episode_strm_to_scrape_target(episode_strm)
-        ok, msg = self._trigger_scrape(Path(str(target)), overwrite=False)
+        show_root = Path(str(task.get("show_root") or ""))
+
+        # 兼容旧队列：历史版本可能把 scrape_target 保存成 .strm 路径。
+        # 单集刮削必须使用 CD2 中的真实视频文件，不能刮削 .strm，也不能退回 Season 目录。
+        stored_target = str(task.get("scrape_target") or "").strip()
+        target = ""
+        if stored_target:
+            stored_path = Path(stored_target)
+            if stored_path.suffix.lower() in self._media_suffixes() and stored_path.exists() and stored_path.is_file():
+                target = stored_target
+            elif stored_path.suffix.lower() == ".strm":
+                logger.debug(f"监控strm刮削网盘：忽略旧队列中的 STRM 刮削目标，重新查找同名真实媒体：{stored_target}")
+
+        if not target:
+            target = self._map_episode_strm_to_scrape_target(episode_strm)
+
+        if not target:
+            mapped = Path(self._map_strm_path_to_scrape_path(str(episode_strm)))
+            candidates = self._episode_media_candidate_paths(episode_strm)
+            result = {
+                "time": self._now_iso(), "action": "episode_scrape_target_missing", "scope": str(episode_strm), "folder": str(mapped.parent if mapped.suffix.lower() == ".strm" else mapped),
+                "scrape": False,
+                "scrape_msg": "未在 MP 刮削目标目录中找到单集真实媒体文件，已跳过；不会退回刮削 Season 目录。",
+                "deleted_nfo": int(task.get("deleted_nfo") or 0),
+                "note": "插件不会刮削 .strm 文件；已按同名视频文件规则查找 mkv/mp4/ts/iso 等格式。" + (f" 已尝试：{', '.join(candidates[:5])}" if candidates else " 未生成候选路径。")
+            }
+            self._append_history(state, result)
+            if self._notify:
+                self._send_notify(result)
+            return {"remove": True, **result}
+        ok, msg = self._trigger_scrape(Path(str(target)))
         result = {
             "time": self._now_iso(), "action": "episode_delayed_scrape", "scope": str(episode_strm), "folder": str(target),
             "scrape": ok, "scrape_msg": msg, "deleted_nfo": int(task.get("deleted_nfo") or 0),
             "note": str(task.get("reason") or "")
         }
+        if ok and show_root and str(show_root):
+            self._ensure_tv_postcheck_task(
+                state,
+                show_root,
+                mode="episodes",
+                episodes=[episode_strm],
+                reason="after_episode_scrape_success",
+                batch_id=str(task.get("postcheck_batch_id") or ""),
+                due_ts=time.time() + max(self._post_scrape_check_delay_minutes, 0) * 60,
+            )
+            result["postcheck_msg"] = "单集刮削事件已发送成功，已从当前时间开始计时 10 分钟后检查图片。"
         self._append_history(state, result)
         if self._notify and not ok:
             self._send_notify(result)
         return {"remove": True, **result}
 
-    def _process_tv_recheck_task(self, task: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    def _process_tv_postcheck_task(self, task: Dict[str, Any], state: Dict[str, Any], manual: bool = False) -> Dict[str, Any]:
+        show_root = Path(str(task.get("show_root") or ""))
+        mode = str(task.get("mode") or "episodes")
+        batch_id = str(task.get("batch_id") or "")
+        if not show_root.exists() or not show_root.is_dir():
+            result = {"time": self._now_iso(), "action": "tv_postcheck_show_missing", "scope": str(show_root), "folder": str(show_root), "scrape": None, "scrape_msg": ("手动检查时剧名目录不存在，保留原任务等待到期检查" if manual else "刮削后检查时剧名目录不存在，任务结束")}
+            task["last_msg"] = result["scrape_msg"]
+            self._append_history(state, result)
+            return {"remove": not manual, **result}
+
+        if mode == "season":
+            season_dirs = [Path(x) for x in self._to_list(task.get("season_dirs") or [])]
+            if not season_dirs:
+                season_dirs = self._unique_season_dirs(self._unique_episode_paths(task.get("episodes") or []), show_root)
+            incomplete = []
+            checked_count = 0
+            for season_dir in season_dirs:
+                if not season_dir:
+                    continue
+                checked_count += 1
+                status = self._tv_season_metadata_status(show_root, season_dir)
+                if not status.get("complete"):
+                    incomplete.append((season_dir, status))
+            if incomplete:
+                names = "、".join([f"{sd.name} 缺 {','.join(st.get('missing') or [])}" for sd, st in incomplete[:5]])
+                result = {
+                    "time": self._now_iso(), "action": "tv_season_postcheck_manual_incomplete_keep_waiting" if manual else "tv_season_postcheck_incomplete", "scope": str(show_root),
+                    "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
+                    "scrape_msg": (f"手动检查了 {checked_count} 个季目录，仍有 {len(incomplete)} 个季信息不完整；保留原任务到期后再检查。" if manual else f"季信息刮削后检查了 {checked_count} 个季目录，仍有 {len(incomplete)} 个季信息不完整；不会加入 10 天单集复查队列。"),
+                    "missing_count": len(incomplete), "note": names
+                }
+                task["last_msg"] = result["scrape_msg"]
+                self._append_history(state, result)
+                return {"remove": not manual, **result}
+            result = {
+                "time": self._now_iso(), "action": "tv_season_postcheck_complete", "scope": str(show_root),
+                "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
+                "scrape_msg": f"季信息刮削后检查完成，检查 {checked_count} 个季目录，季海报、Season 海报和 season.nfo 均已存在。"
+            }
+            self._append_history(state, result)
+            return {"remove": True, **result}
+
+        if mode == "show":
+            checked_episodes = self._list_strm_files(show_root)
+            missing = [ep for ep in checked_episodes if not self._episode_image_status(ep).get("has_image")]
+            checked_count = len(checked_episodes)
+        else:
+            episode_paths = self._unique_episode_paths(task.get("episodes") or [])
+            # 兼容旧队列：老的 episodes 模式如果没有记录单集，才全剧扫描。
+            if episode_paths:
+                missing = [ep for ep in episode_paths if not self._episode_image_status(ep).get("has_image")]
+                checked_count = len(episode_paths)
+                checked_episodes = episode_paths
+            else:
+                checked_episodes = self._list_strm_files(show_root)
+                missing = [ep for ep in checked_episodes if not self._episode_image_status(ep).get("has_image")]
+                checked_count = len(checked_episodes)
+
+        # 先按当前 STRM 状态清理旧 10 天复查，避免页面继续显示已经有图的旧缓存。
+        cleaned_count = self._sync_tv_recheck_tasks(state, show_root)
+
+        if missing:
+            names = "、".join([self._episode_label(ep, show_root) for ep in missing[:8]])
+            if manual:
+                task["missing_preview"] = self._preview_from_episodes(show_root, missing, limit=8)
+                result = {
+                    "time": self._now_iso(), "action": "tv_postcheck_manual_missing_keep_waiting", "scope": str(show_root),
+                    "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
+                    "scrape_msg": f"手动检查了 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片；保留原任务到期后再检查，不提前加入 10 天复查队列。" + (f" 同时清理旧复查中已完成 {cleaned_count} 集。" if cleaned_count else ""),
+                    "missing_count": len(missing), "note": names,
+                    **self._episode_history_payload(show_root, checked_episodes, prefix="checked"),
+                    **self._episode_history_payload(show_root, missing, prefix="missing"),
+                }
+                task["last_msg"] = result["scrape_msg"]
+                self._append_history(state, result)
+                return {"remove": False, **result}
+            self._ensure_tv_recheck_task(
+                state,
+                show_root,
+                episodes=missing,
+                reason=str(task.get("reason") or "post_scrape_missing_image"),
+                batch_id=batch_id,
+            )
+            result = {
+                "time": self._now_iso(), "action": "tv_postcheck_missing_schedule_recheck", "scope": str(show_root),
+                "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
+                "scrape_msg": f"刮削后检查了 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片，已加入 {self._tv_recheck_days:g} 天复查队列。" + (f" 同时清理旧复查中已完成 {cleaned_count} 集。" if cleaned_count else ""),
+                "missing_count": len(missing), "note": names,
+                **self._episode_history_payload(show_root, checked_episodes, prefix="checked"),
+                **self._episode_history_payload(show_root, missing, prefix="missing"),
+            }
+            self._append_history(state, result)
+            return {"remove": True, **result}
+
+        # 本批全部已有图时，也要清理历史 10 天复查任务。
+        cleaned_count += self._sync_tv_recheck_tasks(state, show_root)
+        result = {
+            "time": self._now_iso(), "action": "tv_postcheck_complete", "scope": str(show_root),
+            "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
+            "scrape_msg": f"刮削后检查完成，检查 {checked_count} 集，均已有对应图片；不加入 10 天复查队列。" + (f" 已同步清理旧复查中已完成 {cleaned_count} 集。" if cleaned_count else ""),
+            **self._episode_history_payload(show_root, checked_episodes, prefix="checked"),
+        }
+        self._append_history(state, result)
+        return {"remove": True, **result}
+
+    def _process_tv_recheck_task(self, task: Dict[str, Any], state: Dict[str, Any], manual: bool = False) -> Dict[str, Any]:
         show_root = Path(str(task.get("show_root") or ""))
         if not show_root.exists() or not show_root.is_dir():
-            result = {"time": self._now_iso(), "action": "tv_recheck_show_missing", "scope": str(show_root), "folder": str(show_root), "scrape": None, "scrape_msg": "10天复查时剧名目录不存在，任务结束"}
+            result = {"time": self._now_iso(), "action": "tv_recheck_show_missing", "scope": str(show_root), "folder": str(show_root), "scrape": None, "scrape_msg": ("手动10天复查时剧名目录不存在，保留原任务等待到期复查" if manual else "10天复查时剧名目录不存在，任务结束")}
+            task["last_msg"] = result["scrape_msg"]
             self._append_history(state, result)
-            return {"remove": True, **result}
-        missing = self._find_missing_episode_images(show_root)
+            return {"remove": not manual, **result}
+        episode_values = task.get("episodes") or []
+        if episode_values:
+            candidates = self._unique_episode_paths(episode_values)
+            missing = [ep for ep in candidates if not self._episode_image_status(ep).get("has_image")]
+            checked_count = len(candidates)
+        else:
+            # 兼容旧队列：老任务没有 episodes 时才全剧扫描。
+            missing = self._find_missing_episode_images(show_root)
+            checked_count = self._count_strm_files(show_root)
+        checked_payload = candidates if episode_values else self._list_strm_files(show_root)
         if not missing:
-            result = {"time": self._now_iso(), "action": "tv_recheck_complete", "scope": str(show_root), "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None, "scrape_msg": "10天复查完成，每一集都有对应图片"}
+            result = {"time": self._now_iso(), "action": "tv_recheck_complete", "scope": str(show_root), "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None, "scrape_msg": f"10天复查完成，检查 {checked_count} 集，均已有对应图片", **self._episode_history_payload(show_root, checked_payload, prefix="checked")}
             self._append_history(state, result)
             return {"remove": True, **result}
+        if manual:
+            task["missing_preview"] = self._preview_from_episodes(show_root, missing, limit=8)
+            result = {
+                "time": self._now_iso(), "action": "tv_recheck_manual_missing_keep_waiting", "scope": str(show_root), "folder": self._map_strm_path_to_scrape_path(str(show_root)),
+                "scrape": None, "scrape_msg": f"手动10天复查检查 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片；保留原任务，不提前删除 nfo 或触发刮削。",
+                "missing_count": len(missing),
+                "note": "、".join([self._episode_label(ep, show_root) for ep in missing[:8]]),
+                **self._episode_history_payload(show_root, missing, prefix="missing"),
+            }
+            task["last_msg"] = result["scrape_msg"]
+            self._append_history(state, result)
+            return {"remove": False, **result}
         total_deleted = 0
+        postcheck_batch_id = self._make_task_batch_id("recheck")
         for episode in missing:
             deleted = self._delete_episode_nfo(episode)
             total_deleted += deleted
-            self._ensure_episode_scrape_task(state, episode, show_root, reason="tv_10day_recheck_missing_image", deleted_nfo=deleted)
+            self._ensure_episode_scrape_task(
+                state,
+                episode,
+                show_root,
+                reason="tv_10day_recheck_missing_image",
+                deleted_nfo=deleted,
+                postcheck_batch_id=postcheck_batch_id,
+            )
         result = {
             "time": self._now_iso(), "action": "tv_recheck_missing_episodes_schedule_scrape", "scope": str(show_root), "folder": self._map_strm_path_to_scrape_path(str(show_root)),
-            "scrape": None, "scrape_msg": f"10天复查发现 {len(missing)} 集缺少对应图片，已删除同名 nfo {total_deleted} 个，{self._episode_scrape_delay_minutes:g} 分钟后逐集刮削。",
-            "missing_count": len(missing), "deleted_nfo": total_deleted
+            "scrape": None, "scrape_msg": f"10天复查检查 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片，已删除同名 nfo {total_deleted} 个，{self._episode_scrape_delay_seconds:g} 秒后逐集刮削。",
+            "missing_count": len(missing), "deleted_nfo": total_deleted,
+            "note": "、".join([self._episode_label(ep, show_root) for ep in missing[:8]]),
+            **self._episode_history_payload(show_root, missing, prefix="missing"),
         }
         self._append_history(state, result)
         return {"remove": True, **result}
 
     # --------------------------- 队列与任务创建 ---------------------------
 
-    def _ensure_episode_scrape_task(self, state: Dict[str, Any], episode_strm: Path, show_root: Path, reason: str = "", deleted_nfo: int = 0):
+    @staticmethod
+    def _make_task_batch_id(prefix: str = "batch") -> str:
+        safe_prefix = re.sub(r"[^A-Za-z0-9_-]+", "_", str(prefix or "batch"))[:24] or "batch"
+        return f"{safe_prefix}_{int(time.time() * 1000)}"
+
+    def _tv_episode_season_scope(self, show_root: Path, episode_strm: Path) -> Path:
+        """返回电视剧初始任务的隔离范围。
+
+        多季剧按 Season 目录隔离；单集直接放在剧名目录时，退回剧名目录。
+        用于确保“先入第一季、后入第二季”时，第一季任务只检查第一季快照，不扫描整部剧。
+        """
+        try:
+            show_root = Path(str(show_root))
+            episode_strm = Path(str(episode_strm))
+            parent = episode_strm.parent
+            if not str(show_root) or not str(parent):
+                return show_root
+            try:
+                parent.relative_to(show_root)
+            except Exception:
+                return show_root
+            return parent if parent != show_root else show_root
+        except Exception:
+            return Path(str(show_root or ""))
+
+    def _ensure_episode_scrape_task(self, state: Dict[str, Any], episode_strm: Path, show_root: Path, reason: str = "", deleted_nfo: int = 0, postcheck_batch_id: str = ""):
         queue = state.setdefault("queue", {})
         key = f"episode::{episode_strm}"
-        due_ts = time.time() + max(self._episode_scrape_delay_minutes, 0) * 60
+        due_ts = time.time() + max(self._episode_scrape_delay_seconds, 0)
         target = self._map_episode_strm_to_scrape_target(episode_strm)
         existing = queue.get(key)
         if existing:
+            # 如果旧任务里残留 .strm 目标，或者当前已能找到真实媒体文件，刷新成真实媒体路径。
+            old_target = str(existing.get("scrape_target") or "")
+            if target and (not old_target or Path(old_target).suffix.lower() == ".strm" or not Path(old_target).exists()):
+                existing["scrape_target"] = str(target)
+            # 单集刮削任务本身可以取更早时间执行；真正的 10 分钟检查会在刮削事件发送成功后再创建。
             existing["due_ts"] = min(float(existing.get("due_ts") or due_ts), due_ts)
             existing["due_at"] = self._ts_to_str(float(existing.get("due_ts") or due_ts))
             existing["duplicate_count"] = int(existing.get("duplicate_count") or 0) + 1
             existing["deleted_nfo"] = int(existing.get("deleted_nfo") or 0) + int(deleted_nfo or 0)
-            existing["last_msg"] = f"重复单集刮削任务已合并，等待：{existing['due_at']}"
+            if postcheck_batch_id and not existing.get("postcheck_batch_id"):
+                existing["postcheck_batch_id"] = str(postcheck_batch_id)
+            existing["last_msg"] = f"重复单集刮削任务已合并，等待：{existing['due_at']}；刮削成功后再计时 10 分钟检查。"
+            self._schedule_delayed_check_until(float(existing.get("due_ts") or due_ts))
             return
         queue[key] = {
             "task_type": "episode_scrape",
@@ -922,36 +1481,162 @@ class LocalMetadataCleaner(_PluginBase):
             "scrape_target": str(target),
             "reason": reason,
             "deleted_nfo": int(deleted_nfo or 0),
+            "postcheck_batch_id": str(postcheck_batch_id or self._make_task_batch_id("ep")),
             "first_seen_ts": time.time(),
             "first_seen": self._now_iso(),
             "due_ts": due_ts,
             "due_at": self._ts_to_str(due_ts),
             "status": "waiting_episode_scrape",
-            "last_msg": f"等待 {self._episode_scrape_delay_minutes:g} 分钟后刮削单集"
+            "last_msg": f"等待 {self._episode_scrape_delay_seconds:g} 秒后刮削单集；刮削成功后再计时 10 分钟检查"
         }
-        self._schedule_delayed_check(max(self._episode_scrape_delay_minutes, 0) * 60)
+        self._schedule_delayed_check(max(self._episode_scrape_delay_seconds, 0))
 
-    def _ensure_tv_recheck_task(self, state: Dict[str, Any], show_root: Path, reason: str = ""):
+    def _ensure_tv_postcheck_task(
+        self,
+        state: Dict[str, Any],
+        show_root: Path,
+        mode: str = "episodes",
+        episodes: List[Path] = None,
+        reason: str = "",
+        batch_id: str = "",
+        due_ts: float = None,
+        season_dirs: List[Path] = None,
+    ):
+        """创建刮削后检查任务。
+
+        关键原则：
+        - 单集模式只应在 MP 单集刮削事件发送成功后创建，10 分钟从成功发送时开始计算；
+        - 同一批次可合并，但不再把新批次合并进旧批次，避免新集被旧到期时间提前检查；
+        - 合并同批次时取更晚时间，保证这一批里最后一集也至少等待完整检查时间。
+        """
         queue = state.setdefault("queue", {})
-        key = f"tv_recheck::{show_root}"
-        due_ts = time.time() + max(self._tv_recheck_days, 0) * 86400
+        episodes = episodes or []
+        season_dirs = season_dirs or []
+        mode = str(mode or "episodes")
+        batch_id = str(batch_id or "").strip()
+        if mode == "episodes" and not batch_id:
+            batch_id = self._make_task_batch_id("postcheck")
+        if mode == "season" and not batch_id:
+            batch_id = self._make_task_batch_id("seasoncheck")
+
+        if due_ts is None:
+            due_ts = time.time() + max(self._post_scrape_check_delay_minutes, 0) * 60
+        due_ts = float(due_ts or 0)
+        if due_ts <= 0:
+            due_ts = time.time() + max(self._post_scrape_check_delay_minutes, 0) * 60
+
+        if mode == "episodes":
+            key = f"tv_postcheck::{mode}::{show_root}::{batch_id}"
+        elif mode == "season":
+            key = f"tv_postcheck::{mode}::{show_root}::{batch_id}"
+        else:
+            # 整剧刮削检查按剧名根目录保留唯一任务，重复事件只会校准时间，不单独创建批次。
+            key = f"tv_postcheck::{mode}::{show_root}"
+
         existing = queue.get(key)
+        episode_strings = [str(x) for x in self._unique_episode_paths(episodes)]
+        season_strings = []
+        seen_season = set()
+        for item in season_dirs:
+            text = str(item or "").strip()
+            if text and text not in seen_season:
+                seen_season.add(text)
+                season_strings.append(text)
+
         if existing:
+            if mode == "episodes":
+                old_eps = self._to_list(existing.get("episodes") or [])
+                merged = old_eps[:]
+                for ep in episode_strings:
+                    if ep not in merged:
+                        merged.append(ep)
+                existing["episodes"] = merged
+            elif mode == "season":
+                old_dirs = self._to_list(existing.get("season_dirs") or [])
+                merged_dirs = old_dirs[:]
+                for sd in season_strings:
+                    if sd not in merged_dirs:
+                        merged_dirs.append(sd)
+                existing["season_dirs"] = merged_dirs
+
             old_due = float(existing.get("due_ts") or 0)
-            if due_ts > old_due:
-                existing["due_ts"] = due_ts
-                existing["due_at"] = self._ts_to_str(due_ts)
+            # 同一批次取更晚时间，避免最后加入的集数还没等够 10 分钟就被检查。
+            existing["due_ts"] = max(old_due or due_ts, due_ts)
+            existing["due_at"] = self._ts_to_str(float(existing.get("due_ts") or due_ts))
             existing["duplicate_count"] = int(existing.get("duplicate_count") or 0) + 1
             existing["reason"] = reason or existing.get("reason") or ""
-            preview = existing.get("missing_preview") or {}
-            if self._preview_needs_refresh(preview):
-                existing["missing_preview"] = self._build_missing_preview(show_root, limit=8)
-            existing["last_msg"] = f"10天复查任务已合并，复查时间：{existing.get('due_at')}"
+            if batch_id:
+                existing["batch_id"] = batch_id
+            existing["last_msg"] = f"刮削后检查任务已合并，检查时间：{existing.get('due_at')}"
+            self._schedule_delayed_check_until(float(existing.get("due_ts") or due_ts))
             return
+
+        queue[key] = {
+            "task_type": "tv_postcheck",
+            "key": key,
+            "show_root": str(show_root),
+            "mode": mode,
+            "episodes": episode_strings,
+            "season_dirs": season_strings,
+            "batch_id": batch_id,
+            "scrape_target": self._map_strm_path_to_scrape_path(str(show_root)),
+            "reason": reason,
+            "first_seen_ts": time.time(),
+            "first_seen": self._now_iso(),
+            "due_ts": due_ts,
+            "due_at": self._ts_to_str(due_ts),
+            "status": "waiting_tv_postcheck",
+            "last_msg": "等待刮削后检查 STRM 图片/季信息是否生成"
+        }
+        self._schedule_delayed_check_until(due_ts)
+
+    def _ensure_tv_recheck_task(self, state: Dict[str, Any], show_root: Path, episodes: List[Path] = None, reason: str = "", batch_id: str = ""):
+        """只把 10 分钟检查后仍缺图的单集加入 10 天复查。"""
+        queue = state.setdefault("queue", {})
+        batch_id = str(batch_id or "").strip()
+        key = f"tv_recheck::{show_root}::{batch_id}" if batch_id else f"tv_recheck::{show_root}"
+        due_ts = time.time() + max(self._tv_recheck_days, 0) * 86400
+        existing = queue.get(key)
+
+        # 再次过滤，避免已经生成图片的集数被加入 10 天复查。
+        episode_strings = []
+        for ep in self._unique_episode_paths(episodes or []):
+            if not self._episode_image_status(ep).get("has_image"):
+                text = str(ep)
+                if text not in episode_strings:
+                    episode_strings.append(text)
+        if not episode_strings:
+            self._sync_tv_recheck_tasks(state, show_root)
+            return
+
+        if existing:
+            old_due = float(existing.get("due_ts") or 0)
+            # 同一批 10 天复查以首次确认缺图时间为准，不因重复检查反复后延。
+            if old_due and old_due < due_ts:
+                due_ts = old_due
+            existing["due_ts"] = due_ts
+            existing["due_at"] = self._ts_to_str(due_ts)
+            old_eps = self._to_list(existing.get("episodes") or [])
+            merged = old_eps[:]
+            for ep in episode_strings:
+                if ep not in merged:
+                    merged.append(ep)
+            existing["episodes"] = merged
+            existing["duplicate_count"] = int(existing.get("duplicate_count") or 0) + 1
+            existing["reason"] = reason or existing.get("reason") or ""
+            if batch_id:
+                existing["batch_id"] = batch_id
+            self._sync_tv_recheck_tasks(state, show_root, task_keys=[key])
+            if key in queue:
+                queue[key]["last_msg"] = f"10天复查任务已合并，复查时间：{queue[key].get('due_at')}"
+            return
+
         queue[key] = {
             "task_type": "tv_recheck",
             "key": key,
             "show_root": str(show_root),
+            "episodes": episode_strings,
+            "batch_id": batch_id,
             "scrape_target": self._map_strm_path_to_scrape_path(str(show_root)),
             "reason": reason,
             "first_seen_ts": time.time(),
@@ -959,26 +1644,77 @@ class LocalMetadataCleaner(_PluginBase):
             "due_ts": due_ts,
             "due_at": self._ts_to_str(due_ts),
             "status": "waiting_tv_recheck",
-            "missing_preview": self._build_missing_preview(show_root, limit=8),
-            "last_msg": f"等待 {self._tv_recheck_days:g} 天后检查每一集是否都有对应图片"
+            "missing_preview": self._preview_from_episodes(show_root, episode_strings, limit=8),
+            "last_msg": f"10 分钟检查后仍缺图，等待 {self._tv_recheck_days:g} 天后复查"
         }
 
-
     def _schedule_delayed_check(self, delay_seconds: float):
-        """创建轻量 Timer，避免必须等到下一次 cron 才处理 10 秒/6 分钟任务；同一时间段只保留一个。"""
+        """按相对秒数安排一次短期队列检查。"""
+        self._schedule_delayed_check_until(time.time() + max(float(delay_seconds or 0), 0))
+
+    def _schedule_delayed_check_until(self, due_ts: float):
+        """安排最近到期的短期任务。
+
+        只用于 10 秒入库检查、30 秒单集刮削、10 分钟刮削后检查；
+        10 天复查按用户要求交给兜底检查周期处理，避免创建长期 Timer。
+        """
         try:
-            delay = max(float(delay_seconds or 0), 0)
-            due_ts = time.time() + delay
-            # 大量剧集同时入库时会创建几十个10秒Timer，这里合并为一个，减少重复队列检查日志。
-            if getattr(self, "_next_timer_due_ts", 0) and abs(float(self._next_timer_due_ts) - due_ts) <= 3:
+            due_ts = float(due_ts or 0)
+            if not due_ts:
                 return
+            now_ts = time.time()
+            delay = max(due_ts - now_ts, 0.5)
+
+            # 清理已经结束的 Timer，避免长期运行后列表增大。
+            self._timers = [t for t in list(getattr(self, "_timers", []) or []) if t.is_alive()]
+
+            current_due = float(getattr(self, "_next_timer_due_ts", 0) or 0)
+            # 已有更早或相近的 Timer 时复用；如果新任务更早，则额外创建一个更早 Timer。
+            if current_due and current_due <= due_ts + 1:
+                return
+
             self._next_timer_due_ts = due_ts
             timer = Timer(delay, self.run_once)
             timer.daemon = True
             timer.start()
             self._timers.append(timer)
+            logger.debug(f"监控strm刮削网盘：已安排短期队列检查，{delay:.1f} 秒后执行")
         except Exception as err:
             logger.debug(f"监控strm刮削网盘：创建延迟检查任务失败：{err}")
+
+    def _restore_queue_timers(self, state: Dict[str, Any] = None):
+        """恢复最近的短期到期任务 Timer。
+
+        MP 重启、保存配置或 stop_service 后，内存 Timer 会丢失；队列仍在。
+        这里只恢复短期任务，10 天复查继续由兜底检查周期处理。
+        """
+        if not self._enabled:
+            return
+        try:
+            state = state or self._load_state()
+            queue = state.get("queue") or {}
+            if not isinstance(queue, dict) or not queue:
+                return
+            now_ts = time.time()
+            nearest_due = None
+            for task in queue.values():
+                if not isinstance(task, dict):
+                    continue
+                task_type = str(task.get("task_type") or "")
+                if task_type not in {"initial", "episode_scrape", "tv_postcheck"}:
+                    continue
+                due_ts = float(task.get("due_ts") or 0)
+                if not due_ts:
+                    continue
+                if due_ts <= now_ts:
+                    nearest_due = now_ts + 0.5
+                    break
+                if nearest_due is None or due_ts < nearest_due:
+                    nearest_due = due_ts
+            if nearest_due:
+                self._schedule_delayed_check_until(nearest_due)
+        except Exception as err:
+            logger.debug(f"监控strm刮削网盘：恢复短期队列定时器失败：{err}")
 
     # --------------------------- 路径与元数据判断 ---------------------------
 
@@ -993,7 +1729,6 @@ class LocalMetadataCleaner(_PluginBase):
         first = rel_parts[0].strip().lower()
         media_type = "tv" if first in {"电视剧", "剧集", "番剧", "动漫", "tv", "series", "shows"} else "movie"
         root_dir_text = self._join_posix(root, *rel_parts[:self._target_depth])
-        strm_path = Path(path_text)
         scrape_dir = self._map_strm_path_to_scrape_path(root_dir_text)
         info = {
             "success": True,
@@ -1064,10 +1799,157 @@ class LocalMetadataCleaner(_PluginBase):
             return {"has_any_metadata": False, "error": str(err), "image_count": image_count, "nfo_count": nfo_count}
         return {"has_any_metadata": (image_count + nfo_count) > 0, "image_count": image_count, "nfo_count": nfo_count, "names": names[:50]}
 
+    def _unique_season_dirs(self, episodes: List[Path], show_root: Path) -> List[Path]:
+        """从本次入库单集中提取唯一季目录。
+
+        只处理位于剧名根目录之下的季目录，例如：
+        /media/电视剧/日韩剧/剧名/Season 2/E01.strm -> Season 2。
+        如果单集直接位于剧名根目录，返回剧名根目录本身。
+        """
+        result: List[Path] = []
+        seen = set()
+        for ep in episodes or []:
+            try:
+                ep = Path(str(ep))
+                parent = ep.parent
+                if not str(parent):
+                    continue
+                # 正常多季结构：剧名根目录 / Season N / E01.strm
+                try:
+                    parent.relative_to(show_root)
+                except Exception:
+                    continue
+                season_dir = parent if parent != show_root else show_root
+                key = str(season_dir)
+                if key and key not in seen:
+                    seen.add(key)
+                    result.append(season_dir)
+            except Exception:
+                continue
+        return result
+
+    def _tv_season_metadata_status(self, show_root: Path, season_dir: Path) -> Dict[str, Any]:
+        """判断当前季信息是否完整。
+
+        按 MP 当前生成结构判断：
+        - 剧名根目录存在 season02-poster.*
+        - 当前季目录存在 poster.*
+        - 当前季目录存在 season.nfo
+        三项都存在才认为季信息完整。
+        """
+        show_root = Path(show_root)
+        season_dir = Path(season_dir)
+        season_num = self._season_number_from_dir(season_dir)
+        root_stems: List[str] = []
+        if season_num is not None:
+            # 能识别出具体季号时，只认可对应季海报，避免 Season 2 被通用 season-poster 误判为完整。
+            root_stems.extend([f"season{season_num:02d}-poster", f"season{season_num}-poster"])
+        else:
+            # 只有无法识别季号时才使用通用 season-poster 兜底。
+            root_stems.append("season-poster")
+        root_poster = self._has_image_with_stems(show_root, root_stems)
+        season_poster = self._has_image_with_stems(season_dir, ["poster"])
+        season_nfo = self._has_file_case_insensitive(season_dir, "season.nfo")
+        missing = []
+        if not root_poster:
+            missing.append((f"season{season_num:02d}-poster.*" if season_num is not None else "seasonXX-poster.*"))
+        if not season_poster:
+            missing.append("Season目录/poster.*")
+        if not season_nfo:
+            missing.append("Season目录/season.nfo")
+        return {
+            "complete": not missing,
+            "missing": missing,
+            "season_number": season_num,
+            "root_poster": root_poster,
+            "season_poster": season_poster,
+            "season_nfo": season_nfo,
+            "show_root": str(show_root),
+            "season_dir": str(season_dir),
+        }
+
+    @staticmethod
+    def _season_number_from_dir(season_dir: Path) -> Optional[int]:
+        name = Path(season_dir).name.strip()
+        patterns = [
+            r"(?i)^season\s*(\d+)$",
+            r"(?i)^s(\d+)$",
+            r"第\s*(\d+)\s*季",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, name)
+            if match:
+                try:
+                    return int(match.group(1))
+                except Exception:
+                    return None
+        return None
+
+    def _has_image_with_stems(self, directory: Path, stems: List[str]) -> bool:
+        stems_lower = {str(stem).lower() for stem in stems if stem}
+        if not stems_lower:
+            return False
+        try:
+            if not directory.exists() or not directory.is_dir():
+                return False
+            for item in directory.iterdir():
+                if not item.is_file():
+                    continue
+                if item.suffix.lower() in self._image_suffixes() and item.stem.lower() in stems_lower:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _has_file_case_insensitive(directory: Path, filename: str) -> bool:
+        wanted = str(filename or "").lower()
+        if not wanted:
+            return False
+        try:
+            if not directory.exists() or not directory.is_dir():
+                return False
+            for item in directory.iterdir():
+                if item.is_file() and item.name.lower() == wanted:
+                    return True
+        except Exception:
+            return False
+        return False
+
     def _episode_image_status(self, episode_strm: Path) -> Dict[str, Any]:
         candidates = self._episode_image_candidates(episode_strm)
         exists = [str(p) for p in candidates if p.exists() and p.is_file()]
+        # 兼容部分刮削器生成的短文件名图片，例如“猎犬 - S02E01-thumb.jpg”，
+        # 只在精确同名候选不存在时，按 SxxEyy 编号在同一季目录内做轻量匹配。
+        if not exists:
+            exists = [str(p) for p in self._episode_image_loose_candidates(episode_strm) if p.exists() and p.is_file()]
         return {"has_image": bool(exists), "exists": exists, "candidates": [str(p) for p in candidates]}
+
+    def _episode_image_loose_candidates(self, episode_strm: Path) -> List[Path]:
+        result: List[Path] = []
+        try:
+            parent = episode_strm.parent
+            if not parent.exists() or not parent.is_dir():
+                return []
+            match = re.search(r"(?i)s(\d{1,2})e(\d{1,3})", episode_strm.stem)
+            if not match:
+                return []
+            season_no = int(match.group(1))
+            episode_no = int(match.group(2))
+            for item in parent.iterdir():
+                if not item.is_file() or item.suffix.lower() not in self._image_suffixes():
+                    continue
+                stem = item.stem.lower()
+                if stem.startswith("season"):
+                    continue
+                item_match = re.search(r"(?i)s(\d{1,2})e(\d{1,3})", item.stem)
+                if not item_match:
+                    continue
+                if int(item_match.group(1)) == season_no and int(item_match.group(2)) == episode_no:
+                    result.append(item)
+        except Exception:
+            return []
+        return result
 
     def _episode_image_candidates(self, episode_strm: Path) -> List[Path]:
         parent = episode_strm.parent
@@ -1118,61 +2000,118 @@ class LocalMetadataCleaner(_PluginBase):
             logger.warning(f"监控strm刮削网盘：检查剧集单集图片失败：{show_root} - {err}")
         return sorted(missing, key=lambda p: str(p))
 
-    @staticmethod
-    def _preview_needs_refresh(preview: Any) -> bool:
-        """判断 10 天复查任务的缺图预览缓存是否需要补全。
+    def _sync_tv_recheck_tasks(self, state: Dict[str, Any], show_root: Path, task_keys: List[str] = None) -> int:
+        """刷新/清理指定剧的 10 天复查任务。
 
-        老版本任务可能只有 total，没有 names，导致详情页看不到具体哪几集。
+        已经生成图片的单集会从 10 天复查队列移除；如果某个复查任务已没有缺图集，直接删除。
+        返回被移除的已完成单集数量。
         """
-        if not isinstance(preview, dict) or not preview:
-            return True
-        if not preview.get("exists"):
-            return True
-        total = int(preview.get("total") or 0)
-        names = preview.get("names") or preview.get("labels") or preview.get("items") or []
-        return total > 0 and not names
+        queue = state.setdefault("queue", {})
+        if not isinstance(queue, dict) or not queue:
+            return 0
+        show_text = str(show_root)
+        selected = set(task_keys or [])
+        removed_done = 0
+        delete_keys: List[str] = []
+        for key, item in list(queue.items()):
+            if selected and key not in selected:
+                continue
+            if not isinstance(item, dict) or str(item.get("task_type") or "") != "tv_recheck":
+                continue
+            if str(item.get("show_root") or "") != show_text:
+                continue
+
+            episode_values = item.get("episodes") or []
+            if episode_values:
+                candidates = self._unique_episode_paths(episode_values)
+                still_missing: List[Path] = []
+                for ep in candidates:
+                    if self._episode_image_status(ep).get("has_image"):
+                        removed_done += 1
+                    else:
+                        still_missing.append(ep)
+            else:
+                # 兼容旧队列：没有记录具体集数时才扫描整剧。
+                still_missing = self._find_missing_episode_images(show_root)
+
+            if not still_missing:
+                delete_keys.append(key)
+                continue
+            item["episodes"] = [str(ep) for ep in still_missing]
+            item["missing_preview"] = self._preview_from_episodes(show_root, still_missing, limit=8)
+            item["last_msg"] = f"等待 {self._tv_recheck_days:g} 天后复查缺图单集；页面已按当前 STRM 状态刷新。"
+
+        for key in delete_keys:
+            queue.pop(key, None)
+        return removed_done
 
     def _refresh_queue_preview_cache_for_display(self, state: Dict[str, Any]) -> bool:
-        """打开详情页时补齐旧队列中的缺图集名称缓存。
+        """打开详情页时按当前 STRM 状态刷新 10 天复查任务。
 
-        只在缓存缺少 names 时扫描，避免每次打开页面都遍历 STRM 目录。
+        旧版本只刷新缓存名称，容易出现“图片已经生成但页面仍显示缺图”。
+        这里会重新检查任务内记录的单集，已经有图的自动移出 10 天复查；全部完成则删除该复查任务。
         """
         queue = state.get("queue") or {}
         if not isinstance(queue, dict) or not queue:
             return False
         changed = False
         refreshed = 0
-        for item in queue.values():
+        for key, item in list(queue.items()):
             if not isinstance(item, dict):
                 continue
             if str(item.get("task_type") or "") != "tv_recheck":
                 continue
-            preview = item.get("missing_preview") or {}
-            if not self._preview_needs_refresh(preview):
-                continue
             show_root = Path(str(item.get("show_root") or ""))
             if not str(show_root):
                 continue
-            item["missing_preview"] = self._build_missing_preview(show_root, limit=8)
-            changed = True
+            before = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+            self._sync_tv_recheck_tasks(state, show_root, task_keys=[key])
+            after_item = queue.get(key)
+            after = json.dumps(after_item, ensure_ascii=False, sort_keys=True, default=str) if isinstance(after_item, dict) else "__removed__"
+            if before != after:
+                changed = True
             refreshed += 1
             # 页面展示最多 10 个任务，防止一次打开页面扫描过多剧集。
             if refreshed >= 10:
                 break
         return changed
 
-    def _build_missing_preview(self, show_root: Path, limit: int = 30) -> Dict[str, Any]:
+    def _unique_episode_paths(self, values: Any) -> List[Path]:
+        result: List[Path] = []
+        seen = set()
+        for value in self._to_list(values):
+            if not value:
+                continue
+            ep = Path(str(value))
+            key = str(ep)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            result.append(ep)
+        return result
+
+    def _list_strm_files(self, show_root: Path) -> List[Path]:
+        episodes: List[Path] = []
         try:
-            if not show_root.exists() or not show_root.is_dir():
-                return {"exists": False, "total": 0, "names": []}
-            missing = self._find_missing_episode_images(show_root)
-            take = max(int(limit or 0), 0)
-            names = [self._episode_label(p, show_root) for p in missing[:take]]
-            paths = [str(p) for p in missing[:take]]
-            return {"exists": True, "total": len(missing), "names": names, "paths": paths, "truncated": len(missing) > len(names), "refresh_time": self._now_iso()}
+            for root, dirs, files in os.walk(show_root, followlinks=False):
+                root_path = Path(root)
+                dirs[:] = [d for d in dirs if not (root_path / d).is_symlink()]
+                for name in files:
+                    if Path(name).suffix.lower() == ".strm":
+                        episodes.append(root_path / name)
         except Exception as err:
-            logger.debug(f"监控strm刮削网盘：生成缺图集预览失败：{show_root} - {err}")
-            return {"exists": False, "total": 0, "names": []}
+            logger.debug(f"监控strm刮削网盘：枚举 STRM 集数失败：{show_root} - {err}")
+        return sorted(episodes, key=lambda p: str(p))
+
+    def _count_strm_files(self, show_root: Path) -> int:
+        return len(self._list_strm_files(show_root))
+
+    def _preview_from_episodes(self, show_root: Path, episodes: Any, limit: int = 8) -> Dict[str, Any]:
+        eps = self._unique_episode_paths(episodes)
+        take = max(int(limit or 0), 0)
+        names = [self._episode_label(p, show_root) for p in eps[:take]]
+        paths = [str(p) for p in eps[:take]]
+        return {"exists": bool(show_root), "total": len(eps), "names": names, "paths": paths, "truncated": len(eps) > len(names), "refresh_time": self._now_iso()}
 
     @staticmethod
     def _episode_label(episode: Path, show_root: Path = None) -> str:
@@ -1190,29 +2129,44 @@ class LocalMetadataCleaner(_PluginBase):
 
     def _map_episode_strm_to_scrape_target(self, episode_strm: Path) -> str:
         mapped = Path(self._map_strm_path_to_scrape_path(str(episode_strm)))
-        # STRM 库是 .strm，网盘里通常是 .mkv/.mp4 等真实媒体，优先找同名真实媒体文件。
-        if mapped.suffix.lower() == ".strm":
-            parent = mapped.parent
-            stem = mapped.stem
-            try:
-                if parent.exists() and parent.is_dir():
-                    for suffix in self._media_suffixes():
-                        candidate = parent / f"{stem}{suffix}"
-                        if candidate.exists() and candidate.is_file():
-                            return str(candidate)
-                    # 大小写或后缀不标准时，按 stem 扫同目录。
-                    for item in parent.iterdir():
-                        if item.is_file() and item.stem == stem and item.suffix.lower() in self._media_suffixes():
-                            return str(item)
-            except Exception as err:
-                logger.debug(f"监控strm刮削网盘：查找网盘同名单集媒体失败：{mapped} - {err}")
-            # 找不到真实文件就退回季目录，避免直接把不存在的 .strm 交给 MP。
-            return str(parent)
-        return str(mapped)
+        # STRM 库是 .strm，MP 实际刮削必须使用 CD2 中的真实媒体文件。
+        # 单集目标按同名规则匹配：
+        # /media/.../E01.strm -> /CD2/.../E01.mkv、E01.mp4、E01.ts 等所有支持视频格式。
+        # 不读取 STRM 内容里的 HTTP 短链文件名，避免 CMS 短链名与网盘实际文件名不一致导致误匹配。
+        # 找不到时返回空字符串，由任务处理阶段记录失败并通知，不再退回刮削 Season 目录。
+        if mapped.suffix.lower() != ".strm":
+            return str(mapped) if mapped.exists() else ""
+
+        parent = mapped.parent
+        stem = mapped.stem
+        try:
+            if not parent.exists() or not parent.is_dir():
+                return ""
+
+            # 先按固定视频后缀逐个尝试，命中任意真实媒体文件即可刮削该集。
+            for suffix in self._media_suffixes():
+                candidate = parent / f"{stem}{suffix}"
+                if candidate.exists() and candidate.is_file():
+                    return str(candidate)
+
+            # 大小写或后缀不标准时，按 stem 扫同目录。
+            for item in parent.iterdir():
+                if item.is_file() and item.stem == stem and item.suffix.lower() in self._media_suffixes():
+                    return str(item)
+        except Exception as err:
+            logger.debug(f"监控strm刮削网盘：查找网盘单集真实媒体失败：{mapped} - {err}")
+        return ""
+
+    def _episode_media_candidate_paths(self, episode_strm: Path) -> List[str]:
+        """返回单集 STRM 映射到 CD2 后会尝试查找的同名视频路径。"""
+        mapped = Path(self._map_strm_path_to_scrape_path(str(episode_strm)))
+        if mapped.suffix.lower() != ".strm":
+            return [str(mapped)]
+        return [str(mapped.with_suffix(suffix)) for suffix in self._media_suffixes()]
 
     # --------------------------- 刮削 ---------------------------
 
-    def _trigger_scrape(self, target: Path, overwrite: Optional[bool] = None) -> Tuple[bool, str]:
+    def _trigger_scrape(self, target: Path) -> Tuple[bool, str]:
         if not self._scrape:
             return False, "未启用刮削"
         if StorageChain is None:
@@ -1220,9 +2174,10 @@ class LocalMetadataCleaner(_PluginBase):
         try:
             if self._storagechain is None:
                 self._storagechain = StorageChain()
+            # 当前 MP 本地存储 get_item 需要 pathlib.Path，传 str 会触发：'str' object has no attribute 'exists'。
+            # 因此这里统一使用 Path 对象，不再用字符串兜底。
+            target = Path(target)
             fileitem = self._storagechain.get_file_item(storage=self._storage, path=target)
-            if not fileitem:
-                fileitem = self._storagechain.get_file_item(storage=self._storage, path=str(target))
             if not fileitem:
                 return False, f"无法获取文件项，请确认路径在 MP 容器内可见：{target}"
             file_list = self._file_list_for_scrape(target)
@@ -1230,11 +2185,12 @@ class LocalMetadataCleaner(_PluginBase):
                 "fileitem": fileitem,
                 "file_list": file_list,
                 "meta": None,
-                "mediainfo": None,
-                "overwrite": bool(self._overwrite if overwrite is None else overwrite)
+                "mediainfo": None
             })
             scope = "文件" if target.is_file() else "目录"
-            return True, f"已发送 MP 刮削事件，{scope}：{target}，媒体文件 {len(file_list)} 个"
+            msg = f"已发送 MP 刮削事件，{scope}：{target}，媒体文件 {len(file_list)} 个"
+            logger.info(f"监控strm刮削网盘：{msg}")
+            return True, msg
         except Exception as err:
             logger.error(f"监控strm刮削网盘：触发刮削失败：{target} - {err}\n{traceback.format_exc()}")
             return False, str(err)
@@ -1507,22 +2463,154 @@ class LocalMetadataCleaner(_PluginBase):
 
     # --------------------------- 队列操作与状态 ---------------------------
 
-    def _get_queue_select_items(self) -> List[Dict[str, str]]:
-        state = self._load_state()
-        queue = state.get("queue") or {}
-        if not isinstance(queue, dict) or not queue:
-            return []
-        items: List[Dict[str, str]] = []
-        for key, meta in sorted(queue.items(), key=lambda kv: float((kv[1] or {}).get("due_ts") or 0)):
-            if not isinstance(meta, dict):
-                meta = {}
-            task_type = str(meta.get("task_type") or "")
-            due = str(meta.get("due_at") or "")
-            title = self._queue_title(str(key), meta)
-            if due:
-                title = f"{title} ｜ {due}"
-            items.append({"title": title, "value": str(key)})
-        return items
+
+    def _check_api_key(self, apikey: str) -> bool:
+        token = str(getattr(settings, "API_TOKEN", "") or "")
+        if not token:
+            return True
+        return str(apikey or "") == token
+
+    def api_delete_queue(self, key: str = "", apikey: str = ""):
+        if not self._check_api_key(apikey):
+            return schemas.Response(success=False, message="API密钥错误")
+        key = str(key or "").strip()
+        if not key:
+            return schemas.Response(success=False, message="缺少任务标识")
+        deleted, missing = self._delete_queue_items([key])
+        if deleted:
+            logger.info(f"监控strm刮削网盘：详情页删除队列任务 {key}")
+            return schemas.Response(success=True, message="任务已删除")
+        return schemas.Response(success=False, message="未找到任务" if missing else "删除失败")
+
+    def api_delete_episode_group(self, show_root: str = "", status: str = "", apikey: str = ""):
+        if not self._check_api_key(apikey):
+            return schemas.Response(success=False, message="API密钥错误")
+        show_root = str(show_root or "").strip()
+        status = str(status or "").strip()
+        if not show_root:
+            return schemas.Response(success=False, message="缺少剧名目录")
+        with self._lock:
+            state = self._load_state()
+            queue = state.get("queue") or {}
+            keys = []
+            if isinstance(queue, dict):
+                for key, meta in queue.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    if str(meta.get("task_type") or "") != "episode_scrape":
+                        continue
+                    if str(meta.get("show_root") or "") != show_root:
+                        continue
+                    if status and str(meta.get("status") or "") != status:
+                        continue
+                    keys.append(str(key))
+        deleted, missing = self._delete_queue_items(keys)
+        if deleted:
+            logger.info(f"监控strm刮削网盘：详情页删除同剧单集任务组 {show_root}，共 {deleted} 个")
+            return schemas.Response(success=True, message=f"已删除 {deleted} 个单集任务")
+        return schemas.Response(success=False, message="未找到同剧单集任务" if not missing else "删除失败")
+
+    def api_run_queue(self, key: str = "", apikey: str = ""):
+        if not self._check_api_key(apikey):
+            return schemas.Response(success=False, message="API密钥错误")
+        key = str(key or "").strip()
+        if not key:
+            return schemas.Response(success=False, message="缺少任务标识")
+        done, kept, missing, messages = self._run_queue_items([key], manual=True)
+        if done or kept:
+            msg = messages[0] if messages else ("任务已执行" if done else "已检查，任务保留")
+            logger.info(f"监控strm刮削网盘：详情页立即执行队列任务 {key}，完成 {done}，保留 {kept}")
+            return schemas.Response(success=True, message=msg)
+        return schemas.Response(success=False, message="未找到任务" if missing else "任务执行失败")
+
+    def api_run_episode_group(self, show_root: str = "", status: str = "", apikey: str = ""):
+        if not self._check_api_key(apikey):
+            return schemas.Response(success=False, message="API密钥错误")
+        show_root = str(show_root or "").strip()
+        status = str(status or "").strip()
+        if not show_root:
+            return schemas.Response(success=False, message="缺少剧名目录")
+        with self._lock:
+            state = self._load_state()
+            queue = state.get("queue") or {}
+            keys = []
+            if isinstance(queue, dict):
+                for key, meta in queue.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    if str(meta.get("task_type") or "") != "episode_scrape":
+                        continue
+                    if str(meta.get("show_root") or "") != show_root:
+                        continue
+                    if status and str(meta.get("status") or "") != status:
+                        continue
+                    keys.append(str(key))
+        done, kept, missing, _messages = self._run_queue_items(keys, manual=True)
+        if done or kept:
+            logger.info(f"监控strm刮削网盘：详情页立即执行同剧单集任务组 {show_root}，完成 {done}，保留 {kept}")
+            return schemas.Response(success=True, message=f"已立即执行 {done} 个单集任务" + (f"，保留 {kept} 个检查任务" if kept else ""))
+        return schemas.Response(success=False, message="未找到同剧单集任务" if not missing else "任务执行失败")
+
+    def _run_queue_items(self, keys: List[str], manual: bool = True) -> Tuple[int, int, int, List[str]]:
+        keys = [str(x).strip() for x in keys if str(x or "").strip()]
+        if not keys:
+            return 0, 0, 0, []
+        with self._lock:
+            state = self._load_state()
+            queue = state.setdefault("queue", {})
+            done = 0
+            kept = 0
+            missing = 0
+            messages: List[str] = []
+            remove_keys: List[str] = []
+            for key in keys:
+                task = queue.get(key)
+                if task is None:
+                    missing += 1
+                    continue
+                if not isinstance(task, dict):
+                    remove_keys.append(key)
+                    done += 1
+                    continue
+                try:
+                    result = self._process_queue_task(key, task, state, manual=manual)
+                except Exception as err:
+                    logger.error(f"监控strm刮削网盘：手动执行队列任务失败 {key}：{err}\n{traceback.format_exc()}")
+                    messages.append(f"任务执行失败：{err}")
+                    continue
+                task["last_result"] = result
+                msg = str(result.get("scrape_msg") or result.get("message") or "").strip()
+                if msg:
+                    messages.append(msg)
+                if result.get("remove", True):
+                    remove_keys.append(key)
+                    done += 1
+                else:
+                    kept += 1
+            for key in remove_keys:
+                queue.pop(key, None)
+            self.save_data("state", state)
+        self._restore_queue_timers()
+        return done, kept, missing, messages
+
+    def api_clear_queue(self, apikey: str = ""):
+        if not self._check_api_key(apikey):
+            return schemas.Response(success=False, message="API密钥错误")
+        count = self._clear_queue_items()
+        logger.info(f"监控strm刮削网盘：详情页清空待处理队列，共删除 {count} 个任务")
+        return schemas.Response(success=True, message=f"已清空 {count} 个任务")
+
+    def api_clear_history(self, apikey: str = ""):
+        if not self._check_api_key(apikey):
+            return schemas.Response(success=False, message="API密钥错误")
+        with self._lock:
+            state = self._load_state()
+            history = state.get("history") or []
+            count = len(history) if isinstance(history, list) else 0
+            state["history"] = []
+            self.save_data("state", state)
+        logger.info(f"监控strm刮削网盘：详情页清空历史记录，共删除 {count} 条")
+        return schemas.Response(success=True, message=f"已清空 {count} 条历史记录")
 
     def _delete_queue_items(self, keys: List[str]) -> Tuple[int, int]:
         keys = [str(x).strip() for x in keys if str(x or "").strip()]
@@ -1539,8 +2627,11 @@ class LocalMetadataCleaner(_PluginBase):
                     missing += 1
                     continue
                 deleted += 1
-                self._append_history(state, {"time": self._now_iso(), "action": "queue_deleted_by_user", "scope": key, "folder": key, "scrape": None, "scrape_msg": "用户手动删除队列任务，未执行刮削"})
+                if isinstance(meta, dict):
+                    self._clear_task_markers(state, meta)
+                self._append_history(state, {"time": self._now_iso(), "action": "queue_deleted_by_user", "scope": key, "folder": key, "scrape": None, "scrape_msg": "用户手动删除队列任务，已同步清理该任务相关去重标记，未执行刮削"})
             self.save_data("state", state)
+        self._restore_queue_timers()
         return deleted, missing
 
     def _clear_queue_items(self) -> int:
@@ -1550,9 +2641,38 @@ class LocalMetadataCleaner(_PluginBase):
             count = len(queue) if isinstance(queue, dict) else 0
             if count:
                 state["queue"] = {}
-                self._append_history(state, {"time": self._now_iso(), "action": "queue_cleared_by_user", "scope": "全部待处理队列", "folder": "全部待处理队列", "scrape": None, "scrape_msg": f"用户手动清空队列，共 {count} 个任务"})
+                # 队列全部清空时，同步清理本插件的去重标记，避免失败任务重新入库仍被合并跳过。
+                state["markers"] = {}
+                self._append_history(state, {"time": self._now_iso(), "action": "queue_cleared_by_user", "scope": "全部待处理队列", "folder": "全部待处理队列", "scrape": None, "scrape_msg": f"用户手动清空队列，共 {count} 个任务，并已清理去重标记"})
                 self.save_data("state", state)
+        self._restore_queue_timers()
         return count
+
+
+    def _clear_task_markers(self, state: Dict[str, Any], task: Dict[str, Any]):
+        """清理与队列任务相关的去重标记。
+
+        手动删除队列任务后，如果不清理 marker，重新入库同一部剧时可能被误判为
+        “近期已触发整剧刮削”，导致不再立即尝试刮削。
+        """
+        markers = state.get("markers")
+        if not isinstance(markers, dict):
+            return
+        candidates = []
+        for key in ("show_root", "check_dir", "raw_path", "strm_path", "episode_strm"):
+            value = str(task.get(key) or "").strip()
+            if value:
+                candidates.append(value)
+                # 单集任务删除时同步尝试清理其季目录 marker。
+                try:
+                    path_value = Path(value)
+                    if path_value.suffix.lower() == ".strm":
+                        candidates.append(str(path_value.parent))
+                except Exception:
+                    pass
+        for value in candidates:
+            markers.pop(f"tv_root_whole_scrape::{value}", None)
+            markers.pop(f"tv_season_scrape::{value}", None)
 
     def _load_state(self) -> Dict[str, Any]:
         data = self.get_data("state") or {}
@@ -1588,13 +2708,23 @@ class LocalMetadataCleaner(_PluginBase):
             old_ts = float(old.get("_dedupe_ts") or 0)
             if old_ts and now_ts - old_ts <= 600:
                 old["time"] = result.get("time") or old.get("time")
+                for field in [
+                    # 展示文字也要同步，否则同类记录 10 分钟内去重后，页面可能显示旧的“检查 X 集”。
+                    "scrape_msg", "postcheck_msg", "metadata",
+                    "checked_episodes", "checked_episode_labels", "checked_episode_total", "checked_episode_truncated",
+                    "missing_episodes", "missing_episode_labels", "missing_episode_total", "missing_episode_truncated",
+                    "scraped_episodes", "scraped_episode_labels", "scraped_episode_total", "scraped_episode_truncated",
+                    "missing_count", "existing_count", "deleted_nfo", "note",
+                ]:
+                    if result.get(field) not in (None, "", [], {}):
+                        old[field] = result.get(field)
                 old["duplicate_count"] = int(old.get("duplicate_count") or 1) + 1
                 old["_dedupe_ts"] = now_ts
                 return
         result["_dedupe_key"] = key
         result["_dedupe_ts"] = now_ts
         history.append(result)
-        state["history"] = history[-100:]
+        state["history"] = history[-self.HISTORY_LIMIT:]
 
     @staticmethod
     def _history_dedupe_key(result: Dict[str, Any]) -> str:
@@ -1736,8 +2866,9 @@ class LocalMetadataCleaner(_PluginBase):
         return {".jpg", ".jpeg", ".png", ".webp"}
 
     @staticmethod
-    def _media_suffixes() -> set:
-        return {".mp4", ".mkv", ".ts", ".iso", ".avi", ".rmvb", ".wmv", ".mov", ".m2ts", ".flv", ".mpeg", ".mpg"}
+    def _media_suffixes() -> tuple:
+        # 按常见程度排序，单集刮削时会依次尝试把 .strm 替换成这些视频后缀。
+        return (".mkv", ".mp4", ".ts", ".m2ts", ".iso", ".mov", ".avi", ".rmvb", ".wmv", ".flv", ".mpeg", ".mpg")
 
     def _send_notify(self, result: Dict[str, Any]):
         try:
@@ -1766,6 +2897,9 @@ class LocalMetadataCleaner(_PluginBase):
             if preview.get("total", 0) > 0:
                 return f"10天复查：{name}（当前缺图 {preview.get('total')} 集）"
             return f"10天复查：{name}"
+        if task_type == "tv_postcheck":
+            show_root = Path(str(item.get("show_root") or ""))
+            return f"刮削后检查：{show_root.name or str(show_root)}"
         if task_type == "episode_scrape":
             ep = Path(str(item.get("episode_strm") or ""))
             return f"单集刮削：{ep.stem or key}"
@@ -1777,14 +2911,16 @@ class LocalMetadataCleaner(_PluginBase):
     def _help_text(self) -> str:
         return (
             "逻辑说明：\n"
-            "1. 本插件复用 MP 全局 WebhookMessage 入库事件，建议先启用‘媒体库服务器通知’插件；只要它能收到 Emby 新入库，本插件也能监听同一条事件。\n"
-            "2. 判断是否刮削完整只看 STRM 库路径，不扫描 CD2：默认 STRM 检查根路径为 /media。\n"
-            "3. 需要刮削时，通过 MP 刮削目标根路径触发 MP 刮削，例如 /media/电影/华语电影/片名/xxx.strm → /CD2/115/CMS影库/影视/电影/华语电影/片名。\n"
-            "4. 电影：检查片名目录是否同时存在 backdrop、fanart、poster/folder/cover 类图片和任意 nfo；完整则跳过，不完整则立即刮削一次，不进入后续队列。\n"
-            "5. 电视剧/番剧：定位 STRM 所在剧名根目录。剧名根目录没有任何图片/nfo 时，立即刮削整部剧；已有根目录信息时，只检查入库单集是否有对应图片，缺图则删除该集同名 nfo，等待 6 分钟后刮削该集。\n"
-            "6. 电视剧/番剧会按剧名根目录合并入库事件，并合并一个 10 天复查任务；到期后遍历该剧所有 strm，发现缺少对应图片的单集，删除同名 nfo 并等待 6 分钟后逐集刮削。\n"
-            "7. 媒体库过滤会同时识别路径第一层和第二层，例如 /media/电视剧/国产剧/... 可命中‘电视剧’或‘国产剧’。\n"
-            "8. 队列操作只删除插件里的等待任务，不会删除实际文件；清空历史记录只清空页面记录。"
+            "1. 本插件适用于想要整理刮削网盘的用户，依赖‘媒体库服务器通知’插件和 CloudDrive2（CD2）。\n"
+            "2. 原理：收到 Emby 入库通知后，先检查 STRM 路径里的刮削信息是否完整；判断需要刮削时，再去刮削 CD2 挂载的网盘文件。\n"
+            "3. MP 必须同时映射 STRM 文件夹和 CD2 文件夹，建议 STRM 映射路径与 Emby 一致。例如 Emby 是 /media，MP 也建议映射为 /media。\n"
+            "4. STRM 检查根路径填写 Emby/MP 看到的 STRM 根目录，例如 /media；MP 刮削目标根路径填写 MP 看到的 CD2 网盘媒体根目录，例如 /CD2/115/CMS影库/影视。兜底检查周期只用于补跑丢失或到期未执行的队列任务。\n"
+            "5. 路径示例：/media/电影/华语电影/片名/xxx.strm 用于检查；需要刮削时映射为 /CD2/115/CMS影库/影视/电影/华语电影/片名。\n"
+            "6. 电影：检查片名目录是否同时存在 backdrop、fanart、poster/folder/cover 类图片和任意 nfo；完整则跳过，不完整则立即刮削一次，不进入后续队列。\n"
+            "7. 电视剧/番剧：定位 STRM 所在剧名根目录。剧名根目录没有任何图片/nfo 时，立即刮削整部剧；刮削事件发送成功后创建 10 分钟检查，缺图集才加入 10 天复查队列。\n"
+            "8. 剧名根目录已有基础信息时，会先检查当前季信息；具体季号只认可 season02-poster 这类对应季海报，避免通用 season-poster 误判第二季完整。缺季信息会刮削当前季并在 10 分钟后复查季信息。\n"
+            "9. 本次入库单集缺图时，先删除该集同名 nfo，等待 30 秒后只刮削该集；单集刮削事件发送成功后，才从成功时间开始计时 10 分钟检查。仍缺图时加入 10 天复查队列；已生成图片的旧复查任务会自动清理。\n"
+            "10. 媒体库过滤会同时识别路径第一层和第二层，例如 /media/电视剧/国产剧/... 可命中‘电视剧’或‘国产剧’；待处理任务可在插件详情页单独立即执行、删除或清空，同一部剧的单集刮削任务会合并展示。检查类任务手动提前检查仍缺图时，会保留原到期时间，不会提前进入10天复查。"
         )
 
     def __update_config(self):
@@ -1799,11 +2935,9 @@ class LocalMetadataCleaner(_PluginBase):
             "scrape_target_root": self._scrape_target_root,
             "cron": self._cron,
             "initial_check_delay_seconds": self._initial_check_delay_seconds,
-            "episode_scrape_delay_minutes": self._episode_scrape_delay_minutes,
+            "episode_scrape_delay_seconds": self._episode_scrape_delay_seconds,
             "tv_recheck_days": self._tv_recheck_days,
             "scrape": self._scrape,
-            "overwrite": self._overwrite,
-            "clear_history": False,
             "queue_delete_items": [],
             "queue_delete_confirm": False,
             "queue_clear_all": False
