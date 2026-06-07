@@ -41,7 +41,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -115,6 +115,7 @@ class LocalMetadataCleaner(_PluginBase):
     _media_server: str = ""
     _include_libraries: List[str] = []
     _all_libraries: List[Dict[str, Any]] = []
+    _library_path_mapping: str = ""
 
     # 路径：检查看 STRM 库，刮削走网盘目标根路径
     _strm_check_root: str = DEFAULT_STRM_CHECK_ROOT
@@ -168,6 +169,7 @@ class LocalMetadataCleaner(_PluginBase):
             self._all_libraries = config.get("all_libraries") or []
             if not isinstance(self._all_libraries, list):
                 self._all_libraries = []
+            self._library_path_mapping = str(config.get("library_path_mapping") or "").strip()
 
             self._strm_check_root = str(config.get("strm_check_root") or self.DEFAULT_STRM_CHECK_ROOT).strip().rstrip("/") or self.DEFAULT_STRM_CHECK_ROOT
             self._scrape_target_root = str(config.get("scrape_target_root") or self.DEFAULT_SCRAPE_TARGET_ROOT).strip().rstrip("/") or self.DEFAULT_SCRAPE_TARGET_ROOT
@@ -322,6 +324,12 @@ class LocalMetadataCleaner(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextarea", "props": {"model": "library_path_mapping", "label": "媒体库路径映射", "placeholder": "动漫|tv|/media/电视剧/国漫,/media/电视剧/日番\n电影|movie|/media/电影/华语电影,/media/电影/外语电影", "rows": 3, "auto-grow": True, "clearable": True, "hint": "可选。用于媒体库名称和 STRM 实际路径不一致的情况；格式：媒体库名称|类型|路径1,路径2，类型 movie 或 tv。", "persistent-hint": True}}]}
+                        ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "strm_check_root", "label": "STRM 检查根路径", "placeholder": self.DEFAULT_STRM_CHECK_ROOT}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "scrape_target_root", "label": "MP 刮削目标根路径", "placeholder": self.DEFAULT_SCRAPE_TARGET_ROOT}}]}
                         ]
@@ -350,6 +358,7 @@ class LocalMetadataCleaner(_PluginBase):
             "media_server": "",
             "include_libraries": [],
             "all_libraries": [],
+            "library_path_mapping": "",
             "strm_check_root": self.DEFAULT_STRM_CHECK_ROOT,
             "scrape_target_root": self.DEFAULT_SCRAPE_TARGET_ROOT,
             "cron": self.DEFAULT_CRON,
@@ -862,12 +871,14 @@ class LocalMetadataCleaner(_PluginBase):
                 return
             payload = self._object_to_dict(event_info)
             event_name = str(self._get_obj_value(event_info, "event") or payload.get("event") or "").strip()
+            channel_raw = self._get_obj_value(event_info, "channel") or payload.get("channel") or ""
+            channel = str(channel_raw or "").strip().lower()
             if event_name and not self._is_item_added_event(event_name):
-                return
-            channel = str(self._get_obj_value(event_info, "channel") or payload.get("channel") or "").strip().lower()
-            if channel and channel not in {"emby", ""}:
+                logger.debug(f"监控strm刮削网盘：收到非入库 Webhook 事件，已忽略：event={event_name or '-'}，channel={channel or '-'}")
                 return
 
+            # 不再只限制 channel=emby。部分媒体库或媒体服务器插件可能传入 jellyfin、plex、media_server 等 channel。
+            # 是否登记任务由后续路径、媒体库映射和 STRM 根路径判断决定，并在 INFO 日志中给出原因。
             raw_path = self._event_info_path(event_info, payload)
             if not raw_path:
                 item_id = str(self._get_obj_value(event_info, "item_id") or self._get_obj_value(event_info, "itemid") or payload.get("item_id") or payload.get("itemid") or "").strip()
@@ -876,16 +887,26 @@ class LocalMetadataCleaner(_PluginBase):
                 if item_info:
                     payload.setdefault("_mp_item_info", item_info)
                     raw_path = self._extract_payload_path(item_info)
+
+            library_candidates = self._extract_library_candidates(payload)
+            library_text = "、".join([str(x) for x in library_candidates if str(x or "").strip()]) or "-"
+            logger.info(
+                f"监控strm刮削网盘：收到入库事件：event={event_name or '-'}，"
+                f"channel={channel or '-'}，path={raw_path or '-'}，library={library_text}"
+            )
+
             if not raw_path:
-                logger.warning("监控strm刮削网盘：收到 MP Webhook 入库事件，但未取得媒体路径")
+                logger.info("监控strm刮削网盘：入库事件判断结果：已忽略，原因：未取得媒体路径")
                 return
+
             result = self._register_incoming_path(payload=payload, raw_path=raw_path, event_name=event_name or "library.new", source="mp_webhook_event")
             if result.get("duplicate"):
-                logger.debug(f"监控strm刮削网盘：重复入库事件已合并：{result.get('task')}")
+                logger.info(f"监控strm刮削网盘：入库事件判断结果：已登记（重复合并），任务：{result.get('task')}")
             elif result.get("success") and not result.get("ignored"):
-                logger.info(f"监控strm刮削网盘：已通过 MP 全局 Webhook 事件登记任务：{result.get('task')}")
+                logger.info(f"监控strm刮削网盘：入库事件判断结果：已登记，任务：{result.get('task')}")
             else:
-                logger.debug(f"监控strm刮削网盘：MP 全局 Webhook 事件未登记任务：{result}")
+                reason = self._event_ignore_reason(result)
+                logger.info(f"监控strm刮削网盘：入库事件判断结果：已忽略，原因：{reason}")
         except Exception as err:
             logger.error(f"监控strm刮削网盘：处理 MP 全局 Webhook 事件失败：{err}\n{traceback.format_exc()}")
 
@@ -1723,6 +1744,14 @@ class LocalMetadataCleaner(_PluginBase):
         root = self._strm_check_root.rstrip("/") or "/media"
         if not self._path_same_or_under(path_text, root):
             return {"success": False, "message": f"路径不在 STRM 检查根路径下：{path_text}"}
+
+        # 优先使用用户配置/媒体库缓存里的“媒体库路径映射”。
+        # 这样可以支持 Emby 媒体库名和 STRM 实际路径不一致的结构，
+        # 例如：动漫|tv|/media/电视剧/国漫,/media/电视剧/日番。
+        mapped_library = self._match_library_mapping(path_text, include_cache=False)
+        if mapped_library:
+            return self._analyse_by_library_mapping(path_text, mapped_library)
+
         rel_parts = self._relative_parts_under_root(path_text, root)
         if len(rel_parts) < self._target_depth:
             return {"success": False, "message": f"路径层级不足，至少需要 {self._target_depth} 级：{path_text}"}
@@ -1737,6 +1766,43 @@ class LocalMetadataCleaner(_PluginBase):
             "check_dir": root_dir_text,
             "scrape_dir": scrape_dir,
             "relative_parts": rel_parts
+        }
+        if media_type == "tv":
+            info.update({"show_root": root_dir_text, "episode_strm": path_text})
+        else:
+            info.update({"movie_dir": root_dir_text})
+        return info
+
+    def _analyse_by_library_mapping(self, path_text: str, mapping: Dict[str, Any]) -> Dict[str, Any]:
+        library_root = self._normalise_path_text(str(mapping.get("path") or "")).rstrip("/")
+        media_type = str(mapping.get("type") or "").strip().lower()
+        if media_type not in {"movie", "tv"}:
+            media_type = "movie"
+        rel_parts = self._relative_parts_under_root(path_text, library_root)
+        if not rel_parts:
+            return {"success": False, "message": f"路径没有落在媒体库子目录下：{path_text}"}
+
+        # 映射路径一般指向“媒体库实际路径/分类目录”，其下一层是片名或剧名。
+        # 如果入库事件直接给到媒体文件，仍尽量以父目录作为检查目录，避免把文件名当目录。
+        if len(rel_parts) == 1 and Path(path_text).suffix.lower() == ".strm":
+            root_dir_text = self._normalise_path_text(str(Path(path_text).parent))
+        else:
+            root_dir_text = self._join_posix(library_root, rel_parts[0])
+
+        scrape_dir = self._map_strm_path_to_scrape_path(root_dir_text)
+        info = {
+            "success": True,
+            "media_type": media_type,
+            "strm_path": path_text,
+            "check_dir": root_dir_text,
+            "scrape_dir": scrape_dir,
+            "relative_parts": self._relative_parts_under_root(path_text, self._strm_check_root.rstrip("/") or "/media"),
+            "library_mapping": {
+                "name": mapping.get("name"),
+                "type": media_type,
+                "path": library_root,
+                "source": mapping.get("source") or "config",
+            }
         }
         if media_type == "tv":
             info.update({"show_root": root_dir_text, "episode_strm": path_text})
@@ -2226,12 +2292,100 @@ class LocalMetadataCleaner(_PluginBase):
             if len(path_parts) >= 2:
                 candidates.append(path_parts[1])
                 candidates.append(f"{path_parts[0]}/{path_parts[1]}")
+
+        mapped_library = self._match_library_mapping(raw_path)
+        if mapped_library:
+            name = str(mapped_library.get("name") or "").strip()
+            if name:
+                candidates.append(name)
+            path_value = str(mapped_library.get("path") or "").strip()
+            if path_value:
+                candidates.append(path_value)
+
         norm_selected = {self._bare_library_name(x) for x in selected if self._bare_library_name(x)}
         norm_candidates = {self._bare_library_name(x) for x in candidates if self._bare_library_name(x)}
         matched = sorted(norm_selected & norm_candidates)
         if matched:
-            return True, "命中已选媒体库", {"mode": "selected", "selected": selected, "candidates": candidates, "matched": matched, "path_parts": path_parts}
-        return False, "未命中已选媒体库，已忽略", {"mode": "not_selected", "selected": selected, "candidates": candidates, "path_parts": path_parts, "raw_path": raw_path}
+            return True, "命中已选媒体库", {"mode": "selected", "selected": selected, "candidates": candidates, "matched": matched, "path_parts": path_parts, "mapping": mapped_library}
+        return False, "未命中已选媒体库，已忽略", {"mode": "not_selected", "selected": selected, "candidates": candidates, "path_parts": path_parts, "raw_path": raw_path, "mapping": mapped_library}
+
+    def _match_library_mapping(self, raw_path: str, include_cache: bool = True) -> Optional[Dict[str, Any]]:
+        path_text = self._normalise_path_text(raw_path)
+        matches: List[Dict[str, Any]] = []
+        for mapping in self._configured_library_mappings():
+            if not include_cache and str(mapping.get("source") or "") != "config":
+                continue
+            map_path = self._normalise_path_text(str(mapping.get("path") or "")).rstrip("/")
+            if map_path and self._path_same_or_under(path_text, map_path):
+                item = dict(mapping)
+                item["path"] = map_path
+                item["path_len"] = len(map_path)
+                matches.append(item)
+        if not matches:
+            return None
+        # 多个路径命中时取最长路径，避免 /media/电视剧 覆盖 /media/电视剧/国漫。
+        matches.sort(key=lambda x: int(x.get("path_len") or 0), reverse=True)
+        return matches[0]
+
+    def _configured_library_mappings(self) -> List[Dict[str, Any]]:
+        mappings: List[Dict[str, Any]] = []
+        seen = set()
+
+        def add_mapping(name: str, media_type: str, paths: List[str], source: str):
+            clean_name = str(name or "").strip()
+            clean_type = str(media_type or "").strip().lower()
+            if clean_type in {"series", "show", "shows", "tvshow", "episode", "anime", "番剧", "电视剧", "剧集", "综艺", "纪录片"}:
+                clean_type = "tv"
+            elif clean_type in {"film", "movies", "电影", "影片"}:
+                clean_type = "movie"
+            if clean_type not in {"movie", "tv"}:
+                clean_type = self._guess_library_type(clean_name, paths)
+            for p in paths:
+                path = self._normalise_path_text(str(p or "")).rstrip("/")
+                if not clean_name or not path:
+                    continue
+                key = (clean_name.lower(), clean_type, path.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                mappings.append({"name": clean_name, "type": clean_type, "path": path, "source": source})
+
+        for line in str(self._library_path_mapping or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [x.strip() for x in line.split("|")]
+            if len(parts) >= 3:
+                name, media_type = parts[0], parts[1]
+                paths_text = "|".join(parts[2:])
+            elif len(parts) == 2:
+                name, media_type = parts[0], ""
+                paths_text = parts[1]
+            else:
+                continue
+            paths = [x.strip() for x in re.split(r"[,，;；]+", paths_text) if x.strip()]
+            add_mapping(name, media_type, paths, "config")
+
+        # 如果媒体服务器缓存里能拿到 Library paths，也作为兜底映射。
+        for lib in self._get_cached_libraries():
+            if not isinstance(lib, dict):
+                continue
+            name = str(lib.get("name") or lib.get("title") or "").strip()
+            paths = self._to_list(lib.get("paths") or [])
+            media_type = str(lib.get("type") or lib.get("media_type") or "").strip().lower()
+            add_mapping(name, media_type, paths, "cache")
+        return mappings
+
+    def _guess_library_type(self, name: str, paths: List[str]) -> str:
+        text = " ".join([str(name or "")] + [str(x or "") for x in paths]).lower()
+        # “动画电影”同时包含“动画”和“电影”，应按电影处理，所以先判断电影关键词。
+        movie_words = ["电影", "movie", "movies", "film"]
+        tv_words = ["电视剧", "剧集", "番剧", "动漫", "国漫", "日番", "综艺", "纪录片", "tv", "series", "show", "anime"]
+        if any(word.lower() in text for word in movie_words):
+            return "movie"
+        if any(word.lower() in text for word in tv_words):
+            return "tv"
+        return "movie"
 
     @staticmethod
     def _bare_library_name(value: Any) -> str:
@@ -2808,6 +2962,19 @@ class LocalMetadataCleaner(_PluginBase):
         return data
 
     @staticmethod
+    def _event_ignore_reason(result: Dict[str, Any]) -> str:
+        message = str((result or {}).get("message") or "未登记任务").strip()
+        if "未命中已选媒体库" in message:
+            return "媒体库不匹配"
+        if "路径不在 STRM" in message or "路径不在STRM" in message:
+            return "路径不在STRM根目录"
+        if "路径层级不足" in message:
+            return "路径层级不足"
+        if "未取得媒体路径" in message:
+            return "未取得媒体路径"
+        return message or "未登记任务"
+
+    @staticmethod
     def _is_item_added_event(event_name: str) -> bool:
         if not event_name:
             return True
@@ -2920,7 +3087,8 @@ class LocalMetadataCleaner(_PluginBase):
             "7. 电视剧/番剧：定位 STRM 所在剧名根目录。剧名根目录没有任何图片/nfo 时，立即刮削整部剧；刮削事件发送成功后创建 10 分钟检查，缺图集才加入 10 天复查队列。\n"
             "8. 剧名根目录已有基础信息时，会先检查当前季信息；具体季号只认可 season02-poster 这类对应季海报，避免通用 season-poster 误判第二季完整。缺季信息会刮削当前季并在 10 分钟后复查季信息。\n"
             "9. 本次入库单集缺图时，先删除该集同名 nfo，等待 30 秒后只刮削该集；单集刮削事件发送成功后，才从成功时间开始计时 10 分钟检查。仍缺图时加入 10 天复查队列；已生成图片的旧复查任务会自动清理。\n"
-            "10. 媒体库过滤会同时识别路径第一层和第二层，例如 /media/电视剧/国产剧/... 可命中‘电视剧’或‘国产剧’；待处理任务可在插件详情页单独立即执行、删除或清空，同一部剧的单集刮削任务会合并展示。检查类任务手动提前检查仍缺图时，会保留原到期时间，不会提前进入10天复查。"
+            "10. 媒体库过滤会同时识别路径第一层和第二层，例如 /media/电视剧/国产剧/... 可命中‘电视剧’或‘国产剧’；如果媒体库名称和实际路径不一致，可在‘媒体库路径映射’里填写：媒体库名称|类型|路径1,路径2，例如 动漫|tv|/media/电视剧/国漫,/media/电视剧/日番。\n"
+            "11. 待处理任务可在插件详情页单独立即执行、删除或清空，同一部剧的单集刮削任务会合并展示。检查类任务手动提前检查仍缺图时，会保留原到期时间，不会提前进入10天复查。"
         )
 
     def __update_config(self):
@@ -2931,6 +3099,7 @@ class LocalMetadataCleaner(_PluginBase):
             "media_server": self._media_server,
             "include_libraries": self._include_libraries,
             "all_libraries": self._all_libraries,
+            "library_path_mapping": self._library_path_mapping,
             "strm_check_root": self._strm_check_root,
             "scrape_target_root": self._scrape_target_root,
             "cron": self._cron,
