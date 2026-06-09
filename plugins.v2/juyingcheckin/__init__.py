@@ -41,7 +41,7 @@ class JuyingCheckin(_PluginBase):
     plugin_name = "聚影签到"
     plugin_desc = "用于聚影自动签到，支持账号密码、多账号、定时执行、代理、失败重试和签到历史。感谢大胖提供的支持。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/signin.png"
-    plugin_version = "1"
+    plugin_version = "1.1"
     plugin_author = "jidian"
     author_url = "https://share.huamucang.top"
     plugin_config_prefix = "juyingcheckin_"
@@ -66,6 +66,8 @@ class JuyingCheckin(_PluginBase):
     _retry_interval: int = 10
     _connect_timeout: int = 10
     _read_timeout: int = 60
+    _clear_history: bool = False
+    _check_proxy: bool = False
     _scheduler: Optional[BackgroundScheduler] = None
 
     def init_plugin(self, config: dict = None):
@@ -89,6 +91,8 @@ class JuyingCheckin(_PluginBase):
         self._random_time_range = str(config.get("random_time_range") or "").strip()
         self._retry_times = self.__safe_int(config.get("retry_times"), default=2, minimum=0, maximum=10)
         self._retry_interval = self.__safe_int(config.get("retry_interval"), default=10, minimum=0, maximum=600)
+        self._clear_history = self.__safe_bool(config.get("clear_history", False))
+        self._check_proxy = self.__safe_bool(config.get("check_proxy", False))
 
         # 兼容旧版 timeout：旧配置只有一个 timeout 时，作为 read_timeout 使用。
         old_timeout = config.get("timeout")
@@ -97,8 +101,24 @@ class JuyingCheckin(_PluginBase):
             config.get("read_timeout", old_timeout), default=60, minimum=5, maximum=300
         )
 
+        need_save = False
+        if self._clear_history:
+            self.save_data("history", [])
+            self.save_data("latest_result", {})
+            logger.info("聚影签到：已清空签到历史记录")
+            self._clear_history = False
+            need_save = True
+
+        if self._check_proxy:
+            self.__check_proxy_status()
+            self._check_proxy = False
+            need_save = True
+
+        if need_save:
+            self.__save_config()
+
         if self._onlyonce:
-            logger.info("聚影签到：收到立即运行一次请求")
+            logger.info("聚影签到：收到保存后运行一次请求")
             self._onlyonce = False
             self.__save_config()
             tz = self.__get_timezone()
@@ -112,7 +132,7 @@ class JuyingCheckin(_PluginBase):
             self._scheduler.start()
 
         if self._enabled and self._cron:
-            logger.info(f"聚影签到：插件已启用，定时周期 {self._cron}，请在设定-服务中确认“聚影签到定时服务”已注册")
+            logger.info(f"聚影签到：插件已启用，定时周期 {self._cron}，下次运行 {self.__next_run_time()}")
         elif self._enabled:
             logger.warning("聚影签到：插件已启用，但 Cron 表达式为空，不会自动定时签到")
 
@@ -159,6 +179,9 @@ class JuyingCheckin(_PluginBase):
                 "component": "VForm",
                 "content": [
                     self.__form_basic_card(),
+                    self.__form_account_card(),
+                    self.__form_schedule_card(),
+                    self.__form_advanced_card(),
                     self.__form_help_card(),
                 ],
             }
@@ -278,7 +301,7 @@ class JuyingCheckin(_PluginBase):
             self.__post_notify(title, text)
 
     def __login_and_checkin_with_retry(self, username: str, password: str) -> Dict[str, Any]:
-        """执行单账号签到；失败后按配置重试。"""
+        """执行单账号签到；只对网络异常、超时、限流或服务端错误重试。"""
         max_attempts = max(1, int(self._retry_times) + 1)
         last_result: Dict[str, Any] = {
             "success": False,
@@ -291,6 +314,7 @@ class JuyingCheckin(_PluginBase):
             "proxy": False,
             "attempt": 0,
             "max_attempts": max_attempts,
+            "retryable": False,
         }
 
         for attempt in range(1, max_attempts + 1):
@@ -307,13 +331,22 @@ class JuyingCheckin(_PluginBase):
                     "raw": {},
                     "user": {},
                     "proxy": bool(self._use_proxy),
+                    "retryable": True,
                 }
 
             result["attempt"] = attempt
             result["max_attempts"] = max_attempts
+            if "retryable" not in result:
+                result["retryable"] = self.__is_retryable_result(result)
             last_result = result
 
             if result.get("success") or result.get("already"):
+                return result
+
+            if not result.get("retryable"):
+                logger.warning(
+                    f"聚影签到：账号 {self.__mask_account(username)} 返回明确失败，不再重试。原因：{result.get('message') or '未知错误'}"
+                )
                 return result
 
             if attempt < max_attempts:
@@ -359,6 +392,7 @@ class JuyingCheckin(_PluginBase):
                 "raw": login_data,
                 "user": user_info,
                 "proxy": bool(login_used_proxy),
+                "retryable": self.__is_retryable_payload(login_data),
             }
 
         token = self.__pick_token(login_data)
@@ -372,6 +406,7 @@ class JuyingCheckin(_PluginBase):
                 "raw": login_data,
                 "user": user_info,
                 "proxy": bool(login_used_proxy),
+                "retryable": False,
             }
 
         checkin_headers = dict(headers)
@@ -410,6 +445,7 @@ class JuyingCheckin(_PluginBase):
             "raw": checkin_data,
             "user": user_info,
             "proxy": used_proxy,
+            "retryable": False if (success or already) else self.__is_retryable_payload(checkin_data),
         }
 
     def __get_accounts(self, silent: bool = False) -> List[Dict[str, str]]:
@@ -576,6 +612,35 @@ class JuyingCheckin(_PluginBase):
             if key in data and data.get(key) not in [None, ""]:
                 return data.get(key)
         return default
+
+
+    @staticmethod
+    def __is_retryable_payload(data: Dict[str, Any]) -> bool:
+        """只对临时性问题重试：限流、5xx、网关/超时等。"""
+        if not isinstance(data, dict):
+            return False
+        try:
+            http_status = int(data.get("_http_status") or 0)
+        except Exception:
+            http_status = 0
+        if http_status in [408, 429, 500, 502, 503, 504]:
+            return True
+        message = str(data.get("message") or data.get("msg") or data.get("error") or "")
+        return any(key in message for key in ["超时", "timeout", "temporarily", "临时", "服务不可用", "网关", "重试"])
+
+    @staticmethod
+    def __is_retryable_result(result: Dict[str, Any]) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if result.get("success") or result.get("already"):
+            return False
+        if result.get("retryable") is not None:
+            return bool(result.get("retryable"))
+        raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+        if JuyingCheckin.__is_retryable_payload(raw):
+            return True
+        message = str(result.get("message") or "")
+        return any(key in message for key in ["网络异常", "请求超时", "连接被重置", "DNS", "代理请求失败"])
 
     @staticmethod
     def __build_notify_title(total: int, success: int, already: int, fail: int) -> str:
@@ -808,6 +873,8 @@ class JuyingCheckin(_PluginBase):
                 "retry_interval": self._retry_interval,
                 "connect_timeout": self._connect_timeout,
                 "read_timeout": self._read_timeout,
+                "clear_history": self._clear_history,
+                "check_proxy": self._check_proxy,
             }
         )
         return data
@@ -833,6 +900,8 @@ class JuyingCheckin(_PluginBase):
             "retry_interval": 10,
             "connect_timeout": 10,
             "read_timeout": 60,
+            "clear_history": False,
+            "check_proxy": False,
         }
 
     def __parse_random_delay_minutes(self) -> int:
@@ -850,6 +919,54 @@ class JuyingCheckin(_PluginBase):
         except Exception:
             logger.warning(f"聚影签到：随机时间范围格式不正确：{raw}，本次不延迟")
             return 0
+
+
+    def __next_run_time(self) -> str:
+        """计算下一次定时运行时间，仅用于详情页展示。"""
+        if not self._enabled or not self._cron:
+            return "--"
+        try:
+            tz = self.__get_timezone()
+            trigger = CronTrigger.from_crontab(self._cron, timezone=tz)
+            now = datetime.datetime.now(tz)
+            next_dt = trigger.get_next_fire_time(None, now)
+            if not next_dt:
+                return "--"
+            return next_dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception as err:
+            logger.warning(f"聚影签到：计算下次运行时间失败：{err}")
+            return "Cron 异常"
+
+    def __check_proxy_status(self):
+        """保存后手动检测代理和站点连通性。"""
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        status = {
+            "timestamp": now,
+            "ok": False,
+            "message": "未检测",
+            "proxy_host": self.__get_mp_proxy_host() or "--",
+        }
+        try:
+            session = requests.Session()
+            url = self.__build_url(self._login_api)
+            headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*"}
+            if self._use_proxy:
+                proxy_host = self.__get_mp_proxy_host()
+                if not proxy_host:
+                    status["message"] = "已开启代理，但未检测到 PROXY_HOST"
+                else:
+                    proxies = {"http": proxy_host, "https": proxy_host}
+                    resp = session.options(url, headers=headers, proxies=proxies, timeout=(self._connect_timeout, self._read_timeout))
+                    status["ok"] = resp.status_code < 500
+                    status["message"] = f"代理可连接，HTTP {resp.status_code}"
+            else:
+                resp = session.options(url, headers=headers, timeout=(self._connect_timeout, self._read_timeout))
+                status["ok"] = resp.status_code < 500
+                status["message"] = f"直连可连接，HTTP {resp.status_code}"
+        except Exception as err:
+            status["message"] = self.__friendly_error(err)
+        self.save_data("proxy_status", status)
+        logger.info(f"聚影签到：代理/网络检测结果：{status.get('message')}")
 
     @staticmethod
     def __safe_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -874,7 +991,7 @@ class JuyingCheckin(_PluginBase):
             "component": "VCard",
             "props": {"variant": "flat", "class": "mb-6", "color": "surface"},
             "content": [
-                self.__card_title("mdi-calendar-check", "基本设置", "#16b1ff"),
+                self.__card_title("mdi-calendar-check", "基础设置", "#16b1ff"),
                 {"component": "VDivider", "props": {"class": "mx-4 my-2"}},
                 {
                     "component": "VCardText",
@@ -886,9 +1003,25 @@ class JuyingCheckin(_PluginBase):
                                 self.__col_switch("enabled", "启用插件", 3),
                                 self.__col_switch("use_proxy", "使用代理", 3),
                                 self.__col_switch("notify", "开启通知", 3),
-                                self.__col_switch("onlyonce", "立即执行一次", 3),
+                                self.__col_switch("onlyonce", "保存后运行一次", 3),
                             ],
                         },
+                    ],
+                },
+            ],
+        }
+
+    def __form_account_card(self) -> Dict[str, Any]:
+        return {
+            "component": "VCard",
+            "props": {"variant": "flat", "class": "mb-6", "color": "surface"},
+            "content": [
+                self.__card_title("mdi-account-key", "账号设置", "#4CAF50"),
+                {"component": "VDivider", "props": {"class": "mx-4 my-2"}},
+                {
+                    "component": "VCardText",
+                    "props": {"class": "px-6 pb-6"},
+                    "content": [
                         {
                             "component": "VRow",
                             "content": [
@@ -918,55 +1051,107 @@ class JuyingCheckin(_PluginBase):
                                 }
                             ],
                         },
+                    ],
+                },
+            ],
+        }
+
+    def __form_schedule_card(self) -> Dict[str, Any]:
+        return {
+            "component": "VCard",
+            "props": {"variant": "flat", "class": "mb-6", "color": "surface"},
+            "content": [
+                self.__card_title("mdi-timetable", "定时与重试", "#FF9800"),
+                {"component": "VDivider", "props": {"class": "mx-4 my-2"}},
+                {
+                    "component": "VCardText",
+                    "props": {"class": "px-6 pb-6"},
+                    "content": [
                         {
                             "component": "VRow",
                             "content": [
-                                self.__col_text("cron", "Cron 表达式", "10 8 * * *", 4, hint="默认每天 08:10 执行", icon="mdi-clock-outline"),
-                                self.__col_text("history_count", "历史保留条数", "30", 4, field_type="number", hint="默认保留最近 30 条签到记录", icon="mdi-history"),
-                                self.__col_text("random_time_range", "随机时间范围(分钟)", "例如：0-30，留空关闭", 4, hint="定时任务会在该范围内随机延迟执行。", icon="mdi-timer-sand"),
+                                self.__col_text("cron", "Cron 表达式", "10 8 * * *", 6, hint="默认每天 08:10 执行", icon="mdi-clock-outline"),
+                                self.__col_text("random_time_range", "随机延迟分钟", "例如：0-30，留空关闭", 6, hint="定时任务会在该范围内随机延迟执行。", icon="mdi-timer-sand"),
                             ],
                         },
                         {
                             "component": "VRow",
                             "content": [
-                                self.__col_text("retry_times", "失败重试次数", "2", 3, field_type="number", hint="失败后的额外重试次数，成功或已签到会提前停止。", icon="mdi-refresh"),
-                                self.__col_text("retry_interval", "重试间隔(秒)", "10", 3, field_type="number", hint="每次失败后等待多少秒再重试。", icon="mdi-timer-refresh-outline"),
-                                self.__col_text("connect_timeout", "连接超时(秒)", "10", 3, field_type="number", hint="建立 TCP 连接的超时时间。", icon="mdi-lan-connect"),
-                                self.__col_text("read_timeout", "读取超时(秒)", "60", 3, field_type="number", hint="等待服务器返回的超时时间。", icon="mdi-timer-outline"),
-                            ],
-                        },
-                        {
-                            "component": "VRow",
-                            "content": [
-                                {
-                                    "component": "VCol",
-                                    "props": {"cols": 12, "md": 6},
-                                    "content": [
-                                        {
-                                            "component": "VSelect",
-                                            "props": {
-                                                "model": "notify_type",
-                                                "label": "消息通知类型",
-                                                "items": [
-                                                    {"title": "插件消息", "value": "Plugin"},
-                                                    {"title": "站点消息", "value": "SiteMessage"},
-                                                    {"title": "资源下载", "value": "Download"},
-                                                    {"title": "整理入库", "value": "Organize"},
-                                                    {"title": "订阅", "value": "Subscribe"},
-                                                    {"title": "媒体服务器通知", "value": "MediaServer"},
-                                                    {"title": "手动处理通知", "value": "Manual"},
-                                                ],
-                                                "prepend-inner-icon": "mdi-message-badge-outline",
-                                                "hint": "默认使用插件消息。",
-                                                "persistent-hint": True,
-                                            },
-                                        }
-                                    ],
-                                }
+                                self.__col_text("retry_times", "失败重试次数", "2", 3, field_type="number", hint="填 3 表示最多执行 1+3 次；成功、已签到、账号密码错误不会继续重试。", icon="mdi-refresh"),
+                                self.__col_text("retry_interval", "重试间隔秒数", "10", 3, field_type="number", hint="每次可重试失败后等待多少秒。", icon="mdi-timer-refresh-outline"),
+                                self.__col_text("connect_timeout", "连接超时秒数", "10", 3, field_type="number", hint="建立连接的超时时间。", icon="mdi-lan-connect"),
+                                self.__col_text("read_timeout", "读取超时秒数", "60", 3, field_type="number", hint="等待服务器响应的超时时间。", icon="mdi-timer-outline"),
                             ],
                         },
                     ],
                 },
+            ],
+        }
+
+    def __form_advanced_card(self) -> Dict[str, Any]:
+        return {
+            "component": "VExpansionPanels",
+            "props": {"class": "mb-6", "variant": "accordion"},
+            "content": [
+                {
+                    "component": "VExpansionPanel",
+                    "content": [
+                        {
+                            "component": "VExpansionPanelTitle",
+                            "content": [
+                                {"component": "VIcon", "props": {"class": "mr-3", "color": "deep-purple"}, "text": "mdi-tune"},
+                                {"component": "span", "text": "高级设置"},
+                            ],
+                        },
+                        {
+                            "component": "VExpansionPanelText",
+                            "content": [
+                                {
+                                    "component": "VRow",
+                                    "content": [
+                                        self.__col_text("site_url", "站点地址", "https://share.huamucang.top", 4, icon="mdi-web"),
+                                        self.__col_text("login_api", "登录接口", "/api/app/login/", 4, icon="mdi-login"),
+                                        self.__col_text("checkin_api", "签到接口", "/api/app/checkin/do/", 4, icon="mdi-check-decagram"),
+                                    ],
+                                },
+                                {
+                                    "component": "VRow",
+                                    "content": [
+                                        self.__col_select_notify_type(),
+                                        self.__col_text("history_count", "历史保留条数", "30", 4, field_type="number", hint="默认保留最近 30 条。", icon="mdi-history"),
+                                        self.__col_switch("check_proxy", "保存后检测代理", 2),
+                                        self.__col_switch("clear_history", "保存后清空历史", 2),
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+    def __col_select_notify_type(self) -> Dict[str, Any]:
+        return {
+            "component": "VCol",
+            "props": {"cols": 12, "md": 4},
+            "content": [
+                {
+                    "component": "VSelect",
+                    "props": {
+                        "model": "notify_type",
+                        "label": "消息通知类型",
+                        "items": [
+                            {"title": "插件消息", "value": "Plugin"},
+                            {"title": "站点消息", "value": "SiteMessage"},
+                            {"title": "资源下载", "value": "Download"},
+                            {"title": "整理入库", "value": "Organize"},
+                            {"title": "订阅", "value": "Subscribe"},
+                            {"title": "媒体服务器通知", "value": "MediaServer"},
+                            {"title": "手动处理通知", "value": "Manual"},
+                        ],
+                        "prepend-inner-icon": "mdi-message-badge-outline",
+                    },
+                }
             ],
         }
 
@@ -981,11 +1166,11 @@ class JuyingCheckin(_PluginBase):
                     "component": "VCardText",
                     "props": {"class": "px-6 pb-6"},
                     "content": [
-                        self.__help_item("mdi-account-key", "登录方式", "使用聚影账号和密码登录接口，不依赖浏览器 Cookie。"),
-                        self.__help_item("mdi-shield-key", "鉴权方式", "登录后自动使用 x-app-user-token 调用签到接口。"),
-                        self.__help_item("mdi-play-circle", "立即执行一次", "打开后点击保存，会在几秒后执行一次签到测试。"),
-                        self.__help_item("mdi-account-multiple", "多账号", "多账号填写为每行一个：账号#密码，也支持青龙变量 JUYING_ACCOUNT。"),
-                        self.__help_item("mdi-proxy", "代理", "开启“使用代理”后会读取 MoviePilot 的 PROXY_HOST。"),
+                        self.__help_item("mdi-account-key", "单账号", "填写上方用户名和密码即可。"),
+                        self.__help_item("mdi-account-multiple", "多账号", "每行一个：账号#密码；也支持青龙变量 JUYING_ACCOUNT。"),
+                        self.__help_item("mdi-play-circle", "保存后运行一次", "打开后保存，会在几秒后执行一次签到测试。"),
+                        self.__help_item("mdi-proxy", "代理", "站点直连失败时开启“使用代理”，插件会读取 MoviePilot 的 PROXY_HOST。"),
+                        self.__help_item("mdi-refresh", "重试", "只对网络异常、超时、限流或服务端错误重试；今日已签到和账号密码错误不会重试。"),
                         self.__help_item("mdi-heart", "感谢", "感谢大胖提供的支持。"),
                     ],
                 },
@@ -1006,11 +1191,21 @@ class JuyingCheckin(_PluginBase):
                 last_status = "已执行"
                 last_color = "warning"
 
+        proxy_status = self.get_data("proxy_status") or {}
+        if proxy_status:
+            proxy_text = "正常" if proxy_status.get("ok") else "异常"
+            proxy_color = "success" if proxy_status.get("ok") else "error"
+            proxy_detail = f"代理检测：{proxy_status.get('timestamp') or '--'}；{proxy_status.get('message') or '--'}"
+        else:
+            proxy_text = "未检测"
+            proxy_color = "info"
+            proxy_detail = "代理检测：暂无记录；可在高级设置打开“保存后检测代理”。"
+
         return {
             "component": "VCard",
             "props": {"variant": "flat", "class": "mb-6 h-100", "color": "surface"},
             "content": [
-                self.__card_title("mdi-movie-check-outline", "设置状态", "#2196F3"),
+                self.__card_title("mdi-view-dashboard-outline", "运行状态", "#2196F3"),
                 {"component": "VDivider", "props": {"class": "mx-4 my-2"}},
                 {
                     "component": "VCardText",
@@ -1020,9 +1215,11 @@ class JuyingCheckin(_PluginBase):
                             "component": "VRow",
                             "content": [
                                 self.__stat_chip("插件状态", "已启用" if self._enabled else "未启用", "success" if self._enabled else "grey"),
-                                self.__stat_chip("账号配置", f"已配置 {accounts_count} 个" if configured else "未配置", "success" if configured else "warning"),
-                                self.__stat_chip("调度周期", self._cron or "未设置", "info"),
-                                self.__stat_chip("最近状态", last_status, last_color),
+                                self.__stat_chip("账号状态", f"已配置 {accounts_count} 个" if configured else "未配置", "success" if configured else "warning"),
+                                self.__stat_chip("定时周期", self._cron or "未设置", "info"),
+                                self.__stat_chip("下次运行", self.__next_run_time(), "primary"),
+                                self.__stat_chip("最近结果", last_status, last_color),
+                                self.__stat_chip("代理状态", proxy_text, proxy_color),
                             ],
                         },
                         {
@@ -1032,7 +1229,7 @@ class JuyingCheckin(_PluginBase):
                                 "variant": "tonal",
                                 "density": "comfortable",
                                 "class": "mt-4",
-                                "text": f"最近执行：{latest.get('timestamp') or '--'}；{latest.get('message') or '暂无执行记录'}",
+                                "text": f"最近执行：{latest.get('timestamp') or '--'}；{latest.get('message') or '暂无执行记录'}。{proxy_detail}",
                             },
                         },
                     ],
@@ -1248,7 +1445,7 @@ class JuyingCheckin(_PluginBase):
     def __stat_chip(label: str, value: str, color: str) -> Dict[str, Any]:
         return {
             "component": "VCol",
-            "props": {"cols": 12, "md": 3},
+            "props": {"cols": 12, "sm": 6, "md": 4, "lg": 2},
             "content": [
                 {
                     "component": "div",

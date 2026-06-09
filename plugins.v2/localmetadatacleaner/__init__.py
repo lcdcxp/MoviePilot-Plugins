@@ -41,7 +41,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "1.5"
+    plugin_version = "1.6"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -121,6 +121,7 @@ class LocalMetadataCleaner(_PluginBase):
     _include_libraries: List[str] = []
     _all_libraries: List[Dict[str, Any]] = []
     _library_path_mapping: str = ""
+    _library_mapping_check_once: bool = False
 
     # 路径：检查看 STRM 库，刮削走网盘目标根路径
     _strm_check_root: str = DEFAULT_STRM_CHECK_ROOT
@@ -175,6 +176,7 @@ class LocalMetadataCleaner(_PluginBase):
             if not isinstance(self._all_libraries, list):
                 self._all_libraries = []
             self._library_path_mapping = str(config.get("library_path_mapping") or "").strip()
+            self._library_mapping_check_once = bool(config.get("library_mapping_check_once", False))
 
             self._strm_check_root = str(config.get("strm_check_root") or self.DEFAULT_STRM_CHECK_ROOT).strip().rstrip("/") or self.DEFAULT_STRM_CHECK_ROOT
             self._scrape_target_root = str(config.get("scrape_target_root") or self.DEFAULT_SCRAPE_TARGET_ROOT).strip().rstrip("/") or self.DEFAULT_SCRAPE_TARGET_ROOT
@@ -217,6 +219,19 @@ class LocalMetadataCleaner(_PluginBase):
             self._queue_delete_confirm = False
             queue_action_done = True
 
+        mapping_check_done = False
+        if self._library_mapping_check_once:
+            report = self._library_mapping_check_report()
+            try:
+                self.save_data("library_mapping_check", report)
+            except Exception as err:
+                logger.warning(f"监控strm刮削网盘：保存媒体库路径映射检测结果失败：{err}")
+            logger.info(f"监控strm刮削网盘：媒体库路径映射检测：{report.get('title')}")
+            for line in self._to_list(report.get("lines") or [])[:8]:
+                logger.info(f"监控strm刮削网盘：媒体库路径映射检测明细：{line}")
+            self._library_mapping_check_once = False
+            mapping_check_done = True
+
         if self._media_server and self._library_cache_needs_refresh():
             self._refresh_library_cache()
             self.__update_config()
@@ -227,7 +242,7 @@ class LocalMetadataCleaner(_PluginBase):
             self._onlyonce = False
             self.__update_config()
 
-        if queue_action_done:
+        if queue_action_done or mapping_check_done:
             self.__update_config()
 
         # 保存配置或 MP 重启后，Timer 会被 stop_service 取消；这里按队列里最近到期任务恢复。
@@ -279,6 +294,12 @@ class LocalMetadataCleaner(_PluginBase):
                 "endpoint": self.api_clear_history,
                 "methods": ["GET"],
                 "summary": "清空历史记录"
+            },
+            {
+                "path": "/library_mapping_check",
+                "endpoint": self.api_library_mapping_check,
+                "methods": ["GET"],
+                "summary": "检测媒体库路径映射"
             }
         ]
 
@@ -329,7 +350,11 @@ class LocalMetadataCleaner(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VTextarea", "props": {"model": "library_path_mapping", "label": "媒体库路径映射", "placeholder": "动漫|tv|/media/电视剧/国漫,/media/电视剧/日番\n电影|movie|/media/电影/华语电影,/media/电影/外语电影", "rows": 3, "auto-grow": True, "clearable": True, "hint": "可选。用于媒体库名称和 STRM 实际路径不一致的情况；格式：媒体库名称|类型|路径1,路径2，类型 movie 或 tv。", "persistent-hint": True}}]}
+                            {"component": "VCol", "props": {"cols": 12}, "content": [
+                                {"component": "VTextarea", "props": {"model": "library_path_mapping", "label": "媒体库路径映射", "placeholder": "动漫|tv|/media/电视剧/国漫,/media/电视剧/日番\n电影|movie|/media/电影/华语电影,/media/电影/外语电影", "rows": 3, "auto-grow": True, "clearable": True, "hint": "可选。用于媒体库名称和 STRM 实际路径不一致的情况；格式：媒体库名称|类型|路径1,路径2，类型 movie 或 tv。", "persistent-hint": True}},
+                                {"component": "VSwitch", "props": {"model": "library_mapping_check_once", "label": "保存后检测媒体库映射", "hint": "打开后保存配置，会立即检测已保存映射并在日志和详情页显示结果；检测完成后自动关闭。", "persistent-hint": True}},
+                                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": "修改映射后打开此开关并保存配置，检测结果会写入插件日志和详情页。"}
+                            ]}
                         ]
                     },
                     {
@@ -364,6 +389,7 @@ class LocalMetadataCleaner(_PluginBase):
             "include_libraries": [],
             "all_libraries": [],
             "library_path_mapping": "",
+            "library_mapping_check_once": False,
             "strm_check_root": self.DEFAULT_STRM_CHECK_ROOT,
             "scrape_target_root": self.DEFAULT_SCRAPE_TARGET_ROOT,
             "cron": self.DEFAULT_CRON,
@@ -386,6 +412,7 @@ class LocalMetadataCleaner(_PluginBase):
         history = state.get("history") or []
         queue_count = len(queue)
         history_display = self._history_for_display(history, limit=10)
+        failure_display = self._history_failure_for_display(history, limit=5)
 
         task_stats = self._queue_stats(queue)
         last_record = history[-1] if history else {}
@@ -393,7 +420,7 @@ class LocalMetadataCleaner(_PluginBase):
         cards: List[Dict[str, Any]] = []
         cards.append(self._overview_path_row(queue_count, task_stats, last_record))
         cards.append(self._queue_section(queue, queue_count))
-        cards.append(self._history_section(history_display))
+        cards.append(self._history_section(history_display, failure_display))
 
         if not queue and not history_display:
             cards.append({
@@ -404,74 +431,145 @@ class LocalMetadataCleaner(_PluginBase):
         return [{"component": "div", "props": {"class": "pa-2"}, "content": cards}]
 
     def _overview_path_row(self, queue_count: int, task_stats: Dict[str, int], last_record: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "component": "VRow",
-            "props": {"class": "mb-3"},
-            "content": [
-                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [self._overview_card(queue_count, task_stats, last_record)]},
-                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [self._path_rule_card()]}
-            ]
-        }
+        """顶部区域：拆成 3 个等宽小卡片，映射检测明细独立成整行，避免左右高度差造成大面积留白。"""
+        content: List[Dict[str, Any]] = [
+            {"component": "VRow", "props": {"class": "mb-3", "dense": True}, "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [self._overview_card(queue_count, task_stats, last_record)]},
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [self._recent_card(last_record)]},
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [self._path_rule_card()]},
+            ]}
+        ]
+        report = self.get_data("library_mapping_check") or {}
+        report_lines = self._to_list(report.get("lines") or []) if isinstance(report, dict) else []
+        if report_lines:
+            content.append(self._mapping_report_card(report, report_lines))
+        return {"component": "div", "content": content}
 
     def _overview_card(self, queue_count: int, task_stats: Dict[str, int], last_record: Dict[str, Any]) -> Dict[str, Any]:
-        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 rounded-lg"}, "content": [
-            self._card_header("mdi-view-dashboard-outline", "运行概览"),
+        """运行状态卡片：只放数字，避免和路径卡片高度相差太大。"""
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 rounded-xl h-100"}, "content": [
+            {"component": "div", "props": {"class": "d-flex align-center justify-space-between ga-2 mb-2"}, "content": [
+                self._card_header("mdi-view-dashboard-outline", "运行概览"),
+                self._chip("运行中" if self._enabled else "未启用", "success" if self._enabled else "grey")
+            ]},
             {"component": "VDivider", "props": {"class": "my-3"}},
-            {"component": "VRow", "content": [
-                self._summary_metric("插件状态", "已启用" if self._enabled else "未启用", "success" if self._enabled else "grey"),
+            {"component": "VRow", "props": {"dense": True}, "content": [
                 self._summary_metric("待处理", f"{queue_count} 个", "info" if queue_count else "success"),
+                self._summary_metric("10分钟检查", f"{task_stats.get('tv_postcheck', 0)} 个", "info" if task_stats.get('tv_postcheck') else "grey"),
                 self._summary_metric("10天复查", f"{task_stats.get('tv_recheck', 0)} 个", "warning" if task_stats.get('tv_recheck') else "grey"),
                 self._summary_metric("单集刮削", f"{task_stats.get('episode_scrape', 0)} 个", "purple" if task_stats.get('episode_scrape') else "grey"),
-            ]},
-            {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mt-3", "text": self._overview_text(last_record)}}
+            ]}
+        ]}
+
+    def _recent_card(self, last_record: Dict[str, Any]) -> Dict[str, Any]:
+        """最近处理卡片：把原来顶部蓝色提示独立出来，填平顶部视觉。"""
+        if last_record:
+            action = self._action_label(str(last_record.get("action") or ""))
+            t = str(last_record.get("time") or "")
+            scope = self._short_path(str(last_record.get("scope") or last_record.get("folder") or ""))
+            desc = scope or "暂无路径"
+            color = "error" if last_record.get("scrape") is False else ("warning" if "missing" in str(last_record.get("action") or "") else "info")
+        else:
+            action = "等待入库事件"
+            t = ""
+            desc = "插件会监听 MP 全局 Webhook 入库事件。"
+            color = "info"
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 rounded-xl h-100"}, "content": [
+            self._card_header("mdi-history", "最近处理"),
+            {"component": "VDivider", "props": {"class": "my-3"}},
+            {"component": "VAlert", "props": {"type": color, "variant": "tonal", "density": "compact", "text": f"{t} · {action}" if t else action}},
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"}, "text": desc},
         ]}
 
     def _path_rule_card(self) -> Dict[str, Any]:
-        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 rounded-lg"}, "content": [
+        """路径规则卡片：只显示关键结果；详细映射检测放到下方整行卡片。"""
+        report = self.get_data("library_mapping_check") or {}
+        ok = bool(report.get("ok")) if isinstance(report, dict) and report else None
+        title = str(report.get("title") or "未检测媒体库映射") if isinstance(report, dict) else "未检测媒体库映射"
+        alert_type = "success" if ok is True else ("warning" if ok is False else "info")
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 rounded-xl h-100"}, "content": [
             self._card_header("mdi-folder-sync-outline", "路径与规则"),
             {"component": "VDivider", "props": {"class": "my-3"}},
-            {"component": "VRow", "content": [
-                self._path_metric("STRM 检查根路径", self._strm_check_root or self.DEFAULT_STRM_CHECK_ROOT),
-                self._path_metric("MP 刮削目标根路径", self._scrape_target_root or self.DEFAULT_SCRAPE_TARGET_ROOT),
+            self._mini_line("STRM 根路径", self._strm_check_root or self.DEFAULT_STRM_CHECK_ROOT),
+            self._mini_line("刮削目标", self._scrape_target_root or self.DEFAULT_SCRAPE_TARGET_ROOT),
+            {"component": "VAlert", "props": {"type": alert_type, "variant": "tonal", "density": "compact", "class": "mt-3", "text": title if report else "配置页打开“保存后检测媒体库映射”并保存，可检查映射规则。"}},
+        ]}
+
+    def _mapping_report_card(self, report: Dict[str, Any], report_lines: List[str]) -> Dict[str, Any]:
+        """媒体库映射检测明细：单独整行展示，避免顶栏左右高度不一致。"""
+        ok = bool(report.get("ok"))
+        preview_lines = report_lines[:6]
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 mb-3 rounded-xl"}, "content": [
+            {"component": "div", "props": {"class": "d-flex align-center justify-space-between ga-2"}, "content": [
+                self._card_header("mdi-clipboard-check-outline", "媒体库映射检测"),
+                self._chip("通过" if ok else "需检查", "success" if ok else "warning")
             ]},
-            {"component": "VAlert", "props": {"type": "success", "variant": "tonal", "density": "compact", "class": "mt-3", "text": "判断是否完整只检查 STRM 库；需要刮削时再把路径映射到 MP 刮削目标。"}}
+            {"component": "VDivider", "props": {"class": "my-3"}},
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-2"}, "text": "仅展示前 6 条，完整明细见插件日志。"},
+            {"component": "VRow", "props": {"dense": True}, "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [self._mini_line("结果", line)]}
+                for line in preview_lines
+            ]},
+            *([{"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": f"还有 {len(report_lines) - len(preview_lines)} 条检测结果已写入日志。"}] if len(report_lines) > len(preview_lines) else [])
         ]}
 
     def _queue_section(self, queue: Dict[str, Any], queue_count: int) -> Dict[str, Any]:
         display_items = self._queue_display_items(queue)
-        queue_items = display_items[:10]
         content: List[Dict[str, Any]] = [
-            self._section_title("mdi-timer-sand", f"待处理任务（{queue_count} 个）", "可单独立即执行；检查类任务若提前执行仍缺图，会保留原到期时间，不会提前加入10天复查。删除操作不删除 STRM、图片、nfo 或网盘文件。")
+            self._section_title("mdi-timer-sand", f"待处理任务（{queue_count} 个）", "按任务类型分组展示；可单独立即执行。检查类任务若提前执行仍缺图，会保留原到期时间，不会提前加入10天复查。")
         ]
-        if queue_items:
+        if display_items:
             content.append({"component": "div", "props": {"class": "d-flex justify-end mb-2"}, "content": [
                 {"component": "VBtn", "props": {"variant": "tonal", "color": "error", "size": "small", "prepend-icon": "mdi-delete-sweep"}, "text": "清空队列", "events": {"click": {"api": "plugin/LocalMetadataCleaner/queue_clear", "method": "get", "params": {"apikey": getattr(settings, "API_TOKEN", "")}}}}
             ]})
-            content.append({"component": "VRow", "content": [
-                {"component": "VCol", "props": {"cols": 12}, "content": [self._queue_display_card(display)]}
-                for display in queue_items
-            ]})
-            if len(display_items) > len(queue_items):
-                content.append({"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "density": "compact", "class": "mt-2", "text": f"页面仅显示前 {len(queue_items)} 组任务，实际共有 {len(display_items)} 组、{queue_count} 个任务。"}})
+            grouped = self._queue_grouped_display_items(display_items)
+            shown_groups = 0
+            shown_items = 0
+            for group in grouped:
+                items = group.get("items") or []
+                if not items:
+                    continue
+                shown_groups += 1
+                group_title = f"{group.get('label')}（{len(items)} 组 / {group.get('task_count', len(items))} 个任务）"
+                content.append(self._queue_group_title(str(group.get("icon") or "mdi-chevron-right"), group_title, str(group.get("desc") or "")))
+                content.append({"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12}, "content": [self._queue_display_card(display)]}
+                    for display in items[:5]
+                ]})
+                shown_items += min(len(items), 5)
+                if len(items) > 5:
+                    content.append({"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "density": "compact", "class": "mt-1 mb-2", "text": f"{group.get('label')} 仅展示前 5 组，其余 {len(items) - 5} 组仍会按队列处理。"}})
+            if shown_groups == 0:
+                content.append({"component": "VAlert", "props": {"type": "success", "variant": "tonal", "density": "compact", "text": "当前没有待处理任务。"}})
+            elif len(display_items) > shown_items:
+                content.append({"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "class": "mt-2", "text": f"当前页面分组展示 {shown_items} 组，实际共有 {len(display_items)} 组、{queue_count} 个任务。"}})
         else:
             content.append({"component": "VAlert", "props": {"type": "success", "variant": "tonal", "density": "compact", "text": "当前没有待处理任务。"}})
-        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 mb-3 rounded-lg"}, "content": content}
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 mb-3 rounded-xl"}, "content": content}
 
-    def _history_section(self, history_display: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _history_section(self, history_display: List[Dict[str, Any]], failure_display: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+        failure_display = failure_display or []
         content: List[Dict[str, Any]] = [
-            self._section_title("mdi-history", "最近处理记录", "已做展示去重。"),
+            self._section_title("mdi-history", "最近处理记录", "已做展示去重；失败/异常记录会优先单独列出，便于排查。"),
             {"component": "div", "props": {"class": "d-flex justify-end mb-2"}, "content": [
                 {"component": "VBtn", "props": {"variant": "tonal", "color": "warning", "size": "small", "prepend-icon": "mdi-broom"}, "text": "清空历史记录", "events": {"click": {"api": "plugin/LocalMetadataCleaner/history_clear", "method": "get", "params": {"apikey": getattr(settings, "API_TOKEN", "")}}}}
             ]}
         ]
+        if failure_display:
+            content.append(self._queue_group_title("mdi-alert-circle-outline", f"最近失败/异常（{len(failure_display)} 条）", "只展示刮削失败、目标缺失、缺图复查等需要关注的记录。"))
+            content.append({"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [self._history_row_card(item)]}
+                for item in failure_display
+            ]})
         if history_display:
+            content.append(self._queue_group_title("mdi-format-list-bulleted", "全部最近记录", "包含成功、跳过、失败和手动操作。"))
             content.append({"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12}, "content": [self._history_row_card(item)]}
                 for item in history_display
             ]})
         else:
             content.append({"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "暂无最近处理记录。"}})
-        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 mb-3 rounded-lg"}, "content": content}
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 mb-3 rounded-xl"}, "content": content}
 
     @staticmethod
     def _card_header(icon: str, title: str) -> Dict[str, Any]:
@@ -494,6 +592,18 @@ class LocalMetadataCleaner(_PluginBase):
         return {"component": "div", "content": content}
 
     @staticmethod
+    def _queue_group_title(icon: str, title: str, subtitle: str = "") -> Dict[str, Any]:
+        content: List[Dict[str, Any]] = [
+            {"component": "div", "props": {"class": "d-flex align-center ga-2 mt-3 mb-1"}, "content": [
+                {"component": "VIcon", "props": {"icon": icon, "color": "primary", "size": "small"}},
+                {"component": "span", "props": {"class": "text-subtitle-2 font-weight-medium"}, "text": title}
+            ]}
+        ]
+        if subtitle:
+            content.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-2"}, "text": subtitle})
+        return {"component": "div", "content": content}
+
+    @staticmethod
     def _summary_metric(label: str, value: str, color: str = "grey") -> Dict[str, Any]:
         return {"component": "VCol", "props": {"cols": 6, "sm": 3}, "content": [
             {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": label},
@@ -504,7 +614,7 @@ class LocalMetadataCleaner(_PluginBase):
     def _path_metric(label: str, value: str) -> Dict[str, Any]:
         return {"component": "VCol", "props": {"cols": 12, "sm": 6}, "content": [
             {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": label},
-            {"component": "VSheet", "props": {"class": "pa-2 rounded text-body-2", "color": "grey-lighten-4"}, "text": value}
+            {"component": "VSheet", "props": {"class": "pa-2 rounded-lg text-caption", "color": "grey-lighten-4"}, "text": value}
         ]}
 
     def _overview_text(self, last_record: Dict[str, Any]) -> str:
@@ -567,6 +677,59 @@ class LocalMetadataCleaner(_PluginBase):
             display.append({"display_type": "single", "key": str(key), "item": item, "min_due_ts": float(item.get("due_ts") or 0)})
         return sorted(display, key=lambda x: float(x.get("min_due_ts") or 0))
 
+    def _queue_grouped_display_items(self, display_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        configs = {
+            "initial": {"label": "等待入库检查", "icon": "mdi-magnify-scan", "desc": "下一步会检查 STRM 目录刮削信息，缺失时再触发电影/电视剧刮削。"},
+            "episode_scrape": {"label": "等待刮削任务", "icon": "mdi-play-circle-outline", "desc": "下一步会触发真实媒体文件刮削；成功后再创建10分钟检查。"},
+            "tv_postcheck": {"label": "等待10分钟检查", "icon": "mdi-timer-check-outline", "desc": "下一步会确认图片/季信息是否已生成；提前手动检查仍缺图时会保留原到期时间。"},
+            "tv_recheck": {"label": "等待10天复查", "icon": "mdi-calendar-clock", "desc": "下一步会再次确认缺图集，仍缺图才删除同名 nfo 并重新排单集刮削。"},
+            "other": {"label": "其他任务", "icon": "mdi-dots-horizontal-circle-outline", "desc": "未知或兼容旧版本的任务。"},
+        }
+        order = ["initial", "episode_scrape", "tv_postcheck", "tv_recheck", "other"]
+        bucket = {key: {**configs[key], "type": key, "items": [], "task_count": 0} for key in order}
+        for display in display_items or []:
+            task_type = self._display_task_type(display)
+            key = task_type if task_type in bucket else "other"
+            bucket[key]["items"].append(display)
+            bucket[key]["task_count"] += self._display_task_count(display)
+        return [bucket[key] for key in order if bucket[key].get("items")]
+
+    @staticmethod
+    def _display_task_type(display: Dict[str, Any]) -> str:
+        if not isinstance(display, dict):
+            return "other"
+        if display.get("display_type") == "episode_group":
+            return "episode_scrape"
+        item = display.get("item") or {}
+        if isinstance(item, dict):
+            return str(item.get("task_type") or "other")
+        return "other"
+
+    @staticmethod
+    def _display_task_count(display: Dict[str, Any]) -> int:
+        if isinstance(display, dict) and display.get("display_type") == "episode_group":
+            return len(display.get("items") or []) or 1
+        return 1
+
+    def _task_next_step(self, task_type: str, item: Dict[str, Any]) -> str:
+        if task_type == "initial":
+            media_type = str(item.get("media_type") or "").lower()
+            if media_type == "movie":
+                return "检查电影目录是否有 poster/fanart/backdrop 和 nfo；缺失时查找真实视频文件并触发 MP 刮削。"
+            if media_type == "tv":
+                return "检查本次入库季/集的刮削信息；缺图时删除同名 nfo，并排单集刮削任务。"
+            return "检查 STRM 路径类型和刮削信息，符合条件后再登记后续任务。"
+        if task_type == "episode_scrape":
+            return "触发这一集真实媒体文件刮削；发送成功后再创建10分钟检查任务。"
+        if task_type == "tv_postcheck":
+            mode = str(item.get("mode") or "episodes")
+            if mode == "season":
+                return "检查本次涉及季的 season 海报、Season 目录 poster 和 season.nfo；仍缺失时记录异常但不提前进入10天复查。"
+            return "检查本批单集图片是否已生成；到期检查仍缺图时才加入10天复查，手动提前检查仍缺图会继续等待原时间。"
+        if task_type == "tv_recheck":
+            return "重新确认缺图集；到期仍缺图时删除同名 nfo，并重新排单集刮削任务。"
+        return "按兼容逻辑处理该任务。"
+
     def _queue_display_card(self, display: Dict[str, Any]) -> Dict[str, Any]:
         if display.get("display_type") == "episode_group":
             return self._episode_group_card(display)
@@ -606,9 +769,10 @@ class LocalMetadataCleaner(_PluginBase):
             detail_lines.append({"component": "div", "props": {"class": "d-flex flex-wrap ga-1 mt-1"}, "content": [self._chip(str(name), "purple") for name in episode_labels]})
             if len(items) > len(episode_labels):
                 detail_lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": f"仅展示前 {len(episode_labels)} 集，其余 {len(items) - len(episode_labels)} 集仍会按队列处理。"})
+        detail_lines.append(self._mini_line("下一步", "触发这些单集的真实媒体文件刮削；每集刮削成功后再各自创建10分钟检查任务。"))
         detail_lines.append(self._mini_line("说明", "页面合并展示；底层仍按单集逐个刮削。"))
 
-        return {"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 rounded-lg"}, "content": [
+        return {"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 rounded-xl"}, "content": [
             {"component": "div", "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-2"}, "content": [
                 {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium"}, "text": title},
                 {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-1"}, "content": chips + [
@@ -676,11 +840,14 @@ class LocalMetadataCleaner(_PluginBase):
             else:
                 detail_lines.append(self._mini_line("当前缺图", "剧名目录暂不可访问，到期会再次检查"))
 
+        next_step = self._task_next_step(task_type, item)
+        if next_step:
+            detail_lines.append(self._mini_line("下一步", next_step))
         msg = str(item.get("last_msg") or "")
         if msg:
             detail_lines.append(self._mini_line("说明", msg))
 
-        return {"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 rounded-lg"}, "content": [
+        return {"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 rounded-xl"}, "content": [
             {"component": "div", "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-2"}, "content": [
                 {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium"}, "text": title},
                 {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-1"}, "content": chips + [
@@ -718,7 +885,7 @@ class LocalMetadataCleaner(_PluginBase):
         if dup > 1:
             detail_lines.append(self._mini_line("重复合并", f"{dup} 次"))
 
-        return {"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 rounded-lg"}, "content": [
+        return {"component": "VCard", "props": {"variant": "tonal", "class": "pa-3 rounded-xl"}, "content": [
             {"component": "div", "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-2"}, "content": [
                 {"component": "div", "content": [
                     {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium"}, "text": title},
@@ -852,6 +1019,33 @@ class LocalMetadataCleaner(_PluginBase):
                 break
         return result
 
+    def _history_failure_for_display(self, history: List[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        seen = set()
+        for item in reversed(history or []):
+            if not isinstance(item, dict) or not self._is_history_failure(item):
+                continue
+            key = (
+                str(item.get("action") or ""),
+                str(item.get("scope") or ""),
+                str(item.get("folder") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+            if len(result) >= limit:
+                break
+        return result
+
+    @staticmethod
+    def _is_history_failure(item: Dict[str, Any]) -> bool:
+        if item.get("scrape") is False:
+            return True
+        action = str(item.get("action") or "").lower()
+        failure_words = ["failed", "target_missing", "show_missing", "manual_missing", "postcheck_incomplete", "recheck_missing", "missing_schedule_recheck"]
+        return any(word in action for word in failure_words)
+
     def stop_service(self):
         try:
             for timer in list(getattr(self, "_timers", []) or []):
@@ -895,23 +1089,24 @@ class LocalMetadataCleaner(_PluginBase):
 
             library_candidates = self._extract_library_candidates(payload)
             library_text = "、".join([str(x) for x in library_candidates if str(x or "").strip()]) or "-"
-            logger.info(
-                f"监控strm刮削网盘：收到入库事件：event={event_name or '-'}，"
-                f"channel={channel or '-'}，path={raw_path or '-'}，library={library_text}"
+            event_debug = (
+                f"event={event_name or '-'}，channel={channel or '-'}，"
+                f"path={raw_path or '-'}，library={library_text}"
             )
+            logger.debug(f"监控strm刮削网盘：收到入库事件：{event_debug}")
 
             if not raw_path:
-                logger.info("监控strm刮削网盘：入库事件判断结果：已忽略，原因：未取得媒体路径")
+                logger.info(f"监控strm刮削网盘：入库事件判断结果：已忽略，原因：未取得媒体路径（{event_debug}）")
                 return
 
             result = self._register_incoming_path(payload=payload, raw_path=raw_path, event_name=event_name or "library.new", source="mp_webhook_event")
             if result.get("duplicate"):
-                logger.info(f"监控strm刮削网盘：入库事件判断结果：已登记（重复合并），任务：{result.get('task')}")
+                logger.debug(f"监控strm刮削网盘：入库事件判断结果：已登记（重复合并），任务：{result.get('task')}（{event_debug}）")
             elif result.get("success") and not result.get("ignored"):
                 logger.info(f"监控strm刮削网盘：入库事件判断结果：已登记，任务：{result.get('task')}")
             else:
                 reason = self._event_ignore_reason(result)
-                logger.info(f"监控strm刮削网盘：入库事件判断结果：已忽略，原因：{reason}")
+                logger.info(f"监控strm刮削网盘：入库事件判断结果：已忽略，原因：{reason}（{event_debug}）")
         except Exception as err:
             logger.error(f"监控strm刮削网盘：处理 MP 全局 Webhook 事件失败：{err}\n{traceback.format_exc()}")
 
@@ -2354,6 +2549,74 @@ class LocalMetadataCleaner(_PluginBase):
 
     # --------------------------- 媒体库 / 服务 ---------------------------
 
+    def _library_mapping_check_report(self) -> Dict[str, Any]:
+        lines: List[str] = []
+        errors: List[str] = []
+        warnings: List[str] = []
+        valid_count = 0
+        mapping_text = str(self._library_path_mapping or "")
+        root = self._normalise_path_text(self._strm_check_root or self.DEFAULT_STRM_CHECK_ROOT).rstrip("/") or self.DEFAULT_STRM_CHECK_ROOT
+        raw_lines = [line.strip() for line in mapping_text.splitlines() if line.strip() and not line.strip().startswith("#")]
+        if not raw_lines:
+            return {"ok": True, "title": "未填写媒体库路径映射，将使用路径自动识别。", "lines": ["未填写映射；特殊库名与路径不一致时建议填写。"], "ts": self._now_iso()}
+
+        for idx, line in enumerate(raw_lines, start=1):
+            parts = [x.strip() for x in line.split("|")]
+            if len(parts) < 3:
+                errors.append(f"第 {idx} 行格式错误，应为：媒体库名称|类型|路径1,路径2")
+                continue
+            name, media_type = parts[0], parts[1].lower()
+            paths_text = "|".join(parts[2:])
+            paths = [self._normalise_path_text(x.strip()).rstrip("/") for x in re.split(r"[,，;；]+", paths_text) if x.strip()]
+            if not name:
+                errors.append(f"第 {idx} 行媒体库名称为空")
+                continue
+            if media_type not in {"movie", "tv"}:
+                errors.append(f"第 {idx} 行类型必须是 movie 或 tv：{media_type or '-'}")
+                continue
+            if not paths:
+                errors.append(f"第 {idx} 行没有填写路径")
+                continue
+            bad_paths = []
+            warn_paths = []
+            for path in paths:
+                if not path.startswith("/"):
+                    bad_paths.append(path)
+                elif not self._path_same_or_under(path, root):
+                    warn_paths.append(path)
+            if bad_paths:
+                errors.append(f"第 {idx} 行路径不是绝对路径：{', '.join(bad_paths[:2])}")
+                continue
+            if warn_paths:
+                warnings.append(f"第 {idx} 行路径不在 STRM 根路径 {root} 下：{', '.join(warn_paths[:2])}")
+            valid_count += len(paths)
+            sample_path = self._mapping_sample_path(paths[0], media_type)
+            try:
+                analyse = self._analyse_by_library_mapping(sample_path, {"name": name, "type": media_type, "path": paths[0], "source": "config"})
+                if analyse.get("success"):
+                    lines.append(f"第 {idx} 行 OK：{name} / {media_type} / {paths[0]} → {self._short_path(str(analyse.get('check_dir') or ''), 48)}")
+                else:
+                    warnings.append(f"第 {idx} 行测试路径未能识别：{analyse.get('message')}")
+            except Exception as err:
+                warnings.append(f"第 {idx} 行测试异常：{err}")
+
+        for msg in errors[:6]:
+            lines.append(f"错误：{msg}")
+        for msg in warnings[:4]:
+            lines.append(f"提醒：{msg}")
+        if not lines:
+            lines.append("映射格式正常。")
+        ok = not errors
+        title = f"映射检测{'通过' if ok else '发现问题'}：有效路径 {valid_count} 个，错误 {len(errors)} 个，提醒 {len(warnings)} 个"
+        return {"ok": ok, "title": title, "lines": lines[:10], "errors": errors, "warnings": warnings, "valid_count": valid_count, "ts": self._now_iso()}
+
+    @staticmethod
+    def _mapping_sample_path(root: str, media_type: str) -> str:
+        root = str(root or "").rstrip("/")
+        if str(media_type or "").lower() == "tv":
+            return f"{root}/示例剧 (2026)/Season 1/示例剧 - S01E01 - 第 1 集.strm"
+        return f"{root}/示例电影 (2026)/示例电影 (2026) - 2160p.strm"
+
     def _library_allowed(self, payload: Any, raw_path: str) -> Tuple[bool, str, Dict[str, Any]]:
         selected = self._parse_include_libraries()
         if not selected:
@@ -2825,6 +3088,21 @@ class LocalMetadataCleaner(_PluginBase):
         self._restore_queue_timers()
         return done, kept, missing, messages
 
+    def api_library_mapping_check(self, apikey: str = ""):
+        if not self._check_api_key(apikey):
+            return schemas.Response(success=False, message="API密钥错误")
+        report = self._library_mapping_check_report()
+        try:
+            self.save_data("library_mapping_check", report)
+        except Exception:
+            pass
+        logger.info(f"监控strm刮削网盘：媒体库路径映射检测：{report.get('title')}")
+        lines = self._to_list(report.get("lines") or [])
+        message = str(report.get("title") or "检测完成")
+        if lines:
+            message += "；" + "；".join(lines[:3])
+        return schemas.Response(success=bool(report.get("ok")), message=message)
+
     def api_clear_queue(self, apikey: str = ""):
         if not self._check_api_key(apikey):
             return schemas.Response(success=False, message="API密钥错误")
@@ -3178,6 +3456,7 @@ class LocalMetadataCleaner(_PluginBase):
             "include_libraries": self._include_libraries,
             "all_libraries": self._all_libraries,
             "library_path_mapping": self._library_path_mapping,
+            "library_mapping_check_once": False,
             "strm_check_root": self._strm_check_root,
             "scrape_target_root": self._scrape_target_root,
             "cron": self._cron,

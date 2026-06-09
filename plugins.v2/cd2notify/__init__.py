@@ -56,7 +56,7 @@ class CD2Notify(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/webhook.png"
     # 插件版本
-    plugin_version = "1"
+    plugin_version = "1.1"
     # 插件作者
     plugin_author = "jidian"
     # 作者主页
@@ -73,10 +73,17 @@ class CD2Notify(_PluginBase):
     _msgtype: str = "Manual"
     _detail_limit: int = 10
     _show_file_name: bool = True
-    _aggregate_notify: bool = False
+    _aggregate_notify: bool = True
     _aggregate_wait: int = 20
     _history_limit: int = 50
     _clear_history: bool = False
+    _test_notify: bool = False
+    _reset_config: bool = False
+    _notify_create: bool = True
+    _notify_delete: bool = True
+    _notify_move: bool = True
+    _notify_rename: bool = True
+    _notify_other: bool = True
     _history: List[Dict[str, Any]] = []
     _pending_file_items: List[CD2ChangeItem] = []
     _pending_file_meta: Dict[str, Any] = {}
@@ -89,10 +96,17 @@ class CD2Notify(_PluginBase):
         self._msgtype = "Manual"
         self._detail_limit = 10
         self._show_file_name = True
-        self._aggregate_notify = False
+        self._aggregate_notify = True
         self._aggregate_wait = 20
         self._history_limit = 50
         self._clear_history = False
+        self._test_notify = False
+        self._reset_config = False
+        self._notify_create = True
+        self._notify_delete = True
+        self._notify_move = True
+        self._notify_rename = True
+        self._notify_other = True
 
         # 初始化聚合通知缓存。开启“等待任务结束后通知”时，会先缓存多次 CD2 回调，
         # 等待一段时间没有新回调后再统一发送一条汇总通知。
@@ -117,6 +131,13 @@ class CD2Notify(_PluginBase):
             self._aggregate_wait = self._to_int(config.get("aggregate_wait", 20), 20)
             self._history_limit = self._to_int(config.get("history_limit", 50), 50)
             self._clear_history = self._to_bool(config.get("clear_history", False))
+            self._test_notify = self._to_bool(config.get("test_notify", False))
+            self._reset_config = self._to_bool(config.get("reset_config", False))
+            self._notify_create = self._to_bool(config.get("notify_create", True))
+            self._notify_delete = self._to_bool(config.get("notify_delete", True))
+            self._notify_move = self._to_bool(config.get("notify_move", True))
+            self._notify_rename = self._to_bool(config.get("notify_rename", True))
+            self._notify_other = self._to_bool(config.get("notify_other", True))
 
         # v1.0.7 以前历史记录保存在配置中；这里兼容读取并迁移到插件数据。
         history = self.get_data("history") or []
@@ -126,6 +147,28 @@ class CD2Notify(_PluginBase):
                 history = old_history
         self._history = history if isinstance(history, list) else []
 
+        if self._reset_config:
+            self._enabled = True
+            self._notify = True
+            self._msgtype = "Manual"
+            self._detail_limit = 10
+            self._show_file_name = True
+            self._aggregate_notify = True
+            self._aggregate_wait = 20
+            self._history_limit = 50
+            self._clear_history = False
+            self._test_notify = False
+            self._reset_config = False
+            self._notify_create = True
+            self._notify_delete = True
+            self._notify_move = True
+            self._notify_rename = True
+            self._notify_other = True
+            try:
+                self.update_config(self._current_config())
+            except Exception as err:
+                logger.warning(f"{self.plugin_name}: 恢复默认配置失败 - {err}")
+
         if self._clear_history:
             self._history = []
             self.save_data("history", [])
@@ -134,6 +177,14 @@ class CD2Notify(_PluginBase):
                 self.update_config(self._current_config())
             except Exception as err:
                 logger.warning(f"{self.plugin_name}: 重置清空历史开关失败 - {err}")
+
+        if self._test_notify:
+            self._test_notify = False
+            try:
+                self._send_test_notification()
+                self.update_config(self._current_config())
+            except Exception as err:
+                logger.error(f"{self.plugin_name}: 发送测试通知失败 - {err}")
 
         self._trim_history(save=True)
 
@@ -238,6 +289,42 @@ class CD2Notify(_PluginBase):
         }
         return mapping.get((action or "").lower(), "secondary")
 
+    def _action_allowed(self, action: str) -> bool:
+        action = (action or "").lower()
+        if action == "create":
+            return self._notify_create
+        if action == "delete":
+            return self._notify_delete
+        if action == "move":
+            return self._notify_move
+        if action == "rename":
+            return self._notify_rename
+        if action in ("move_rename", "rename_unknown"):
+            return self._notify_move or self._notify_rename
+        return self._notify_other
+
+    def _filter_items_by_config(self, items: List[CD2ChangeItem]) -> List[CD2ChangeItem]:
+        filtered: List[CD2ChangeItem] = []
+        for item in items or []:
+            raw_action = self._normalize_action(item.action or "")
+            action = self._classify_rename(item.source_file or "", item.destination_file or "") if raw_action in ("rename", "move") else raw_action
+            if self._action_allowed(action):
+                filtered.append(item)
+        return filtered
+
+    def _send_test_notification(self):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._send_mp_notice(
+            "【☁️CloudDrive2】",
+            "━━━━━━━━━━━━━━\n"
+            "📊 本次变动：1 项\n"
+            "➕ 新增：1 项\n"
+            "📁 目录：1 项\n"
+            "━━━━━━━━━━━━━━\n"
+            f"🕐 时间：{now}\n\n"
+            "这是一条 CloudDrive2 通知测试消息。"
+        )
+
     @staticmethod
     def _action_mdi(action: str) -> str:
         mapping = {
@@ -279,6 +366,13 @@ class CD2Notify(_PluginBase):
             "aggregate_wait": self._aggregate_wait,
             "history_limit": self._history_limit,
             "clear_history": False,
+            "test_notify": False,
+            "reset_config": False,
+            "notify_create": self._notify_create,
+            "notify_delete": self._notify_delete,
+            "notify_move": self._notify_move,
+            "notify_rename": self._notify_rename,
+            "notify_other": self._notify_other,
         }
 
     def _trim_history(self, save: bool = False) -> None:
@@ -619,9 +713,10 @@ class CD2Notify(_PluginBase):
             return schemas.Response(success=False, message="API令牌错误")
         if not self._enabled:
             return schemas.Response(success=False, message="插件未启用")
+        request.data = self._filter_items_by_config(request.data or [])
         if not request.data:
             logger.warning(f"{self.plugin_name}: 收到CloudDrive2文件事件，但data为空，已忽略")
-            return schemas.Response(success=True, message="没有可处理的文件事件")
+            return schemas.Response(success=True, message="没有可处理的文件事件，或已被操作类型过滤")
 
         if self._aggregate_notify:
             self._queue_file_notify(request)
@@ -746,16 +841,59 @@ class CD2Notify(_PluginBase):
                                                 "show_file_name",
                                                 "显示具体文件名称",
                                                 "primary",
-                                                sm=6,
+                                                sm=3,
                                                 hint="开启后 MP 通知显示详情和完整路径；关闭后 MP 通知不显示详情，查看数据和插件日志仍保留完整路径。",
                                             ),
                                             self._switch_col(
                                                 "clear_history",
                                                 "清空历史记录",
                                                 "error",
-                                                sm=6,
+                                                sm=3,
                                                 hint="打开后保存配置，会立即清空查看数据中的历史记录，并自动关闭。",
                                             ),
+                                            self._switch_col(
+                                                "test_notify",
+                                                "测试通知",
+                                                "warning",
+                                                sm=3,
+                                                hint="打开后保存配置，会发送一条测试通知，并自动关闭。",
+                                            ),
+                                            self._switch_col(
+                                                "reset_config",
+                                                "恢复默认",
+                                                "secondary",
+                                                sm=3,
+                                                hint="打开后保存配置，会恢复推荐默认值，并自动关闭。",
+                                            ),
+                                        ],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VCard",
+                        "props": {"variant": "flat", "class": "mb-4", "color": "surface"},
+                        "content": [
+                            self._card_title("mdi-filter-variant", "操作类型过滤", "#FF9800"),
+                            {"component": "VDivider", "props": {"class": "mx-4 my-2"}},
+                            {
+                                "component": "VCardText",
+                                "props": {"class": "px-6 pb-6"},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {"type": "warning", "variant": "tonal", "class": "mb-4"},
+                                        "text": "默认全部通知。关闭某类操作后，该类型不会发送 MP 通知，也不会写入历史记录。",
+                                    },
+                                    {
+                                        "component": "VRow",
+                                        "content": [
+                                            self._switch_col("notify_create", "新增", "success", sm=2),
+                                            self._switch_col("notify_delete", "删除", "error", sm=2),
+                                            self._switch_col("notify_move", "移动", "warning", sm=2),
+                                            self._switch_col("notify_rename", "重命名", "info", sm=2),
+                                            self._switch_col("notify_other", "其他", "secondary", sm=2),
                                         ],
                                     },
                                 ],
@@ -882,7 +1020,7 @@ class CD2Notify(_PluginBase):
                                     {
                                         "component": "VAlert",
                                         "props": {"type": "warning", "variant": "tonal"},
-                                        "text": "注意：这两个地址填在 CloudDrive2 Webhook 里，不要填到 MP 通知渠道里。保存后建议重启 CloudDrive2，再新建/删除/重命名文件夹测试。",
+                                        "text": "安全提示：apikey 使用 MP 系统 API_TOKEN。不要公开真实 token；公网反代时建议使用 HTTPS，并尽量限制访问来源。这两个地址填在 CloudDrive2 Webhook 里，不要填到 MP 通知渠道里。",
                                     },
                                 ],
                             },
@@ -904,6 +1042,7 @@ class CD2Notify(_PluginBase):
                                         "content": [
                                             self._usage_item("mdi-plus-circle-outline", "新增 / 删除 / 移动 / 重命名", "自动识别 CloudDrive2 的 create、delete、rename 动作；rename 会按路径判断为移动、重命名或移动并重命名。", "success"),
                                             self._usage_item("mdi-timer-sand", "启用汇总通知", "开启后会把连续文件变化合并成一条通知，适合一次性复制、删除或移动很多文件。", "success"),
+                                            self._usage_item("mdi-filter-variant", "操作类型过滤", "可以只通知新增、删除、移动、重命名中的部分类型，减少无关通知。", "warning"),
                                             self._usage_item("mdi-eye-off-outline", "显示具体文件名称", "开启后MP通知显示详情和完整路径；关闭后MP通知不显示详情，查看数据和插件日志仍保留完整路径。", "warning"),
                                             self._usage_item("mdi-history", "查看数据", "插件详情页展示最近的 CloudDrive2 操作历史，方便排查是否收到回调。", "info"),
                                             self._usage_item("mdi-content-copy", "复制说明", "CloudDrive2 没有 copy 动作，复制文件通常会被识别为新增。", "primary"),
@@ -921,10 +1060,17 @@ class CD2Notify(_PluginBase):
             "msgtype": "Manual",
             "detail_limit": 10,
             "show_file_name": True,
-            "aggregate_notify": False,
+            "aggregate_notify": True,
             "aggregate_wait": 20,
             "history_limit": 50,
             "clear_history": False,
+            "test_notify": False,
+            "reset_config": False,
+            "notify_create": True,
+            "notify_delete": True,
+            "notify_move": True,
+            "notify_rename": True,
+            "notify_other": True,
         }
 
     def _usage_item(self, icon: str, title: str, text: str, color: str) -> Dict[str, Any]:
