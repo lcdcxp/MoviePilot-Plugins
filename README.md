@@ -1,17 +1,10 @@
-# MoviePilot-Plugins
+# MoviePilot Plugins
 
-个人 MoviePilot 插件仓库，三个插件保持独立目录，方便后续分别更新。
+个人 MoviePilot 插件仓库。
 
-## 插件列表
+## 当前插件版本
 
-| 插件 ID | 名称 | 版本 | 目录 |
-|---|---|---:|---|
-| CD2Notify | CloudDrive2通知 | 1.1 | plugins.v2/cd2notify |
-| JuyingCheckin | 聚影签到 | 1.1 | plugins.v2/juyingcheckin |
-| LocalMetadataCleaner | 监控strm刮削网盘 | 1.7 | plugins.v2/localmetadatacleaner |
+- CloudDrive2通知：v1.1
+- 聚影签到：v1.1
+- 监控strm刮削网盘：v1.8
 
-## 更新说明
-
-- 2026-06-09：三个插件同步更新。
-
-- 2026-06-09：LocalMetadataCleaner 更新到 1.7。

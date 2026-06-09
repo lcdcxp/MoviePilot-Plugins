@@ -41,7 +41,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "1.7"
+    plugin_version = "1.8"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -1286,180 +1286,271 @@ class LocalMetadataCleaner(_PluginBase):
             return {"remove": True, **result}
 
         if media_type == "tv":
-            show_root = Path(str(task.get("show_root") or task.get("check_dir") or ""))
-            episode_values = self._to_list(task.get("episodes") or [])
-            if not episode_values:
-                episode_values = [str(task.get("episode_strm") or task.get("strm_path") or raw_path)]
-            episode_paths = self._unique_episode_paths(episode_values)
+            return self._process_initial_tv_task(task, state, raw_path)
 
-            root_status = self._tv_root_metadata_status(show_root)
-            if not root_status.get("has_any_metadata"):
-                scrape_dir = Path(self._map_strm_path_to_scrape_path(str(show_root)))
-                markers = state.setdefault("markers", {})
-                marker_key = f"tv_root_whole_scrape::{show_root}"
-                marker = markers.get(marker_key) if isinstance(markers, dict) else None
-                now_ts = time.time()
-                if isinstance(marker, dict) and now_ts - float(marker.get("ts") or 0) < 600:
-                    marker_ts = float(marker.get("ts") or now_ts)
-                    self._ensure_tv_postcheck_task(
-                        state,
-                        show_root,
-                        mode="episodes",
-                        episodes=episode_paths,
-                        reason="root_no_metadata_merged",
-                        batch_id=str(task.get("key") or self._make_task_batch_id("rootcheck")),
-                        due_ts=marker_ts + max(self._post_scrape_check_delay_minutes, 0) * 60,
-                    )
-                    return {
-                        "remove": True,
-                        "time": self._now_iso(),
-                        "action": "tv_root_no_metadata_merge_existing_whole_show_scrape",
-                        "scope": str(show_root),
-                        "folder": str(scrape_dir),
-                        "scrape": None,
-                        "scrape_msg": "同一剧名根目录 10 分钟内已成功触发过整剧刮削，本次入库事件已合并；按首次刮削成功时间 10 分钟后检查缺图集。",
-                        "skip_history": True,
-                    }
+        result = {"time": self._now_iso(), "action": "skip_unknown_media_type", "scope": raw_path, "folder": raw_path, "scrape": None, "scrape_msg": "无法判断电影/电视剧类型，已跳过"}
+        self._append_history(state, result)
+        return {"remove": True, **result}
+
+
+    def _process_initial_tv_task(self, task: Dict[str, Any], state: Dict[str, Any], raw_path: str = "") -> Dict[str, Any]:
+        """处理电视剧入库任务。
+
+        电视剧按“剧信息 → 季信息 → 单集图片”三层处理：
+        - 入库时只处理任务快照里的 STRM 集数，不重新扫描整部剧；
+        - 剧信息/季信息缺失时，用真实单集媒体文件触发 MP 刮削，但不因此跳过该集；
+        - 同一批次同一个真实媒体文件只发送一次刮削事件；
+        - 所有缺图集都进入 10 分钟检查，10 分钟后仍缺图才进入 10 天复查。
+        """
+        show_root = Path(str(task.get("show_root") or task.get("check_dir") or ""))
+        episode_values = self._to_list(task.get("episodes") or [])
+        if not episode_values:
+            episode_values = [str(task.get("episode_strm") or task.get("strm_path") or raw_path)]
+        episode_paths = self._unique_episode_paths(episode_values)
+
+        now_ts = time.time()
+        postcheck_batch_id = self._make_task_batch_id("postcheck")
+        delay_seconds = max(self._post_scrape_check_delay_minutes, 0) * 60
+        postcheck_due_ts = now_ts + delay_seconds
+        sent_targets = set()
+        episode_target_map: Dict[str, str] = {}
+
+        def target_key(value: str) -> str:
+            return str(Path(str(value or ""))) if value else ""
+
+        for episode in episode_paths:
+            try:
+                episode_target_map[str(episode)] = self._map_episode_strm_to_scrape_target(episode) or ""
+            except Exception as err:
+                logger.debug(f"监控strm刮削网盘：查找单集真实媒体失败：{episode} - {err}")
+                episode_target_map[str(episode)] = ""
+
+        # 先检查本次快照内的每一集是否已有图片；缺图集先删除同名 nfo。
+        # 这样即使某集随后被用来触发剧信息/季信息刮削，也不会因为旧 nfo 影响图片生成。
+        missing_eps: List[Path] = []
+        existing_count = 0
+        deleted_total = 0
+        deleted_map: Dict[str, int] = {}
+        for episode_strm in episode_paths:
+            episode_status = self._episode_image_status(episode_strm)
+            if episode_status.get("has_image"):
+                existing_count += 1
+                continue
+            missing_eps.append(episode_strm)
+            deleted = self._delete_episode_nfo(episode_strm)
+            deleted_map[str(episode_strm)] = int(deleted or 0)
+            deleted_total += int(deleted or 0)
+
+        # 1. 检查剧名根目录基础信息。缺失时，用本次快照中的真实单集文件触发一次剧信息刮削。
+        root_status = self._tv_root_metadata_status(show_root)
+        if not root_status.get("has_any_metadata"):
+            scrape_dir = Path(self._map_strm_path_to_scrape_path(str(show_root)))
+            markers = state.setdefault("markers", {})
+            marker_key = f"tv_root_whole_scrape::{show_root}"
+            marker = markers.get(marker_key) if isinstance(markers, dict) else None
+            recent_marker = isinstance(marker, dict) and now_ts - float(marker.get("ts") or 0) < 600
+            ok = False
+            msg = ""
+            scrape_target = ""
+            if recent_marker:
+                scrape_target = str(marker.get("target") or "")
+                if scrape_target:
+                    sent_targets.add(target_key(scrape_target))
+                marker_ts = float(marker.get("ts") or now_ts)
+                self._ensure_tv_postcheck_task(
+                    state,
+                    show_root,
+                    mode="episodes",
+                    episodes=episode_paths,
+                    reason="root_no_metadata_merged",
+                    batch_id=str(task.get("key") or postcheck_batch_id),
+                    due_ts=marker_ts + delay_seconds,
+                )
+                result = {
+                    "time": self._now_iso(),
+                    "action": "tv_root_no_metadata_merge_existing_whole_show_scrape",
+                    "scope": str(show_root),
+                    "folder": str(scrape_target or scrape_dir),
+                    "scrape": None,
+                    "scrape_msg": "同一剧名根目录 10 分钟内已触发过剧信息刮削，本次不重复发送；继续检查季信息和本批次单集。",
+                    "metadata": root_status,
+                    **self._episode_history_payload(show_root, episode_paths, prefix="checked"),
+                }
+                self._append_history(state, result)
+            else:
                 scrape_target = self._map_tv_scope_to_scrape_target(show_root, episode_paths)
                 if scrape_target:
                     ok, msg = self._trigger_scrape(Path(scrape_target))
+                    if ok:
+                        sent_targets.add(target_key(scrape_target))
                 else:
-                    ok = False
                     candidates = self._tv_scope_media_candidate_paths(show_root, episode_paths)
-                    msg = "未在 MP 刮削目标目录中找到可用于整剧刮削的真实单集媒体文件，已跳过目录刮削。" + (f" 已尝试：{', '.join(candidates[:8])}" if candidates else "")
+                    msg = "未在 MP 刮削目标目录中找到可用于剧信息刮削的真实单集媒体文件，已跳过目录刮削。" + (f" 已尝试：{', '.join(candidates[:8])}" if candidates else "")
                 if ok and isinstance(markers, dict):
-                    # 只有成功发出 MP 刮削事件后才写入去重标记，避免失败后重新入库被误判为已刮削。
                     markers[marker_key] = {"ts": now_ts, "time": self._now_iso(), "show_root": str(show_root), "target": str(scrape_target)}
                 result = {
                     "time": self._now_iso(), "action": "tv_root_no_metadata_scrape_whole_show", "scope": str(show_root), "folder": str(scrape_target or scrape_dir),
                     "scrape": ok, "scrape_msg": msg, "metadata": root_status,
                     "note": (
-                        f"剧名根目录没有任何图片/nfo，已使用真实单集媒体文件触发整剧刮削；本次入库范围固定为当前季/当前批次 {len(episode_paths)} 集，后续只检查这批集数，缺图集再加入 10 天复查队列。"
+                        "剧名根目录没有图片/nfo，已用真实单集媒体文件触发剧信息刮削；不会中断季信息和单集检查。"
                         if ok else
-                        "剧名根目录没有任何图片/nfo，但未找到可用于 MP 刮削的真实单集媒体文件；不会退回刮削剧名目录，后续重新入库或立即运行可再次尝试。"
+                        "剧名根目录没有图片/nfo，但未找到可用于 MP 刮削的真实单集媒体文件；不会退回刮削剧名目录，仍继续检查季信息和单集。"
                     ),
                     **self._episode_history_payload(show_root, episode_paths, prefix="checked"),
                 }
                 self._append_history(state, result)
                 if self._notify and not ok:
                     self._send_notify(result)
-                if ok:
-                    self._ensure_tv_postcheck_task(
-                        state,
-                        show_root,
-                        mode="episodes",
-                        episodes=episode_paths,
-                        reason="after_whole_show_scrape",
-                        batch_id=str(task.get("key") or self._make_task_batch_id("rootcheck")),
-                        due_ts=now_ts + max(self._post_scrape_check_delay_minutes, 0) * 60,
-                    )
-                return {"remove": True, **result}
 
-            # 根目录已有刮削信息：如果当前季缺少季信息，先补刮削当前季；随后仍按单集逻辑检查本次入库集。
-            season_dirs = self._unique_season_dirs(episode_paths, show_root)
-            for season_dir in season_dirs:
+        # 2. 检查本次入库涉及的季信息。缺失时，用该季第一集真实文件触发；同一批同文件不重复发事件。
+        season_dirs = self._unique_season_dirs(episode_paths, show_root)
+        for season_dir in season_dirs:
+            try:
                 season_status = self._tv_season_metadata_status(show_root, season_dir)
-                if season_status.get("complete"):
-                    continue
-                scrape_dir = Path(self._map_strm_path_to_scrape_path(str(season_dir)))
-                markers = state.setdefault("markers", {})
-                marker_key = f"tv_season_scrape::{season_dir}"
-                marker = markers.get(marker_key) if isinstance(markers, dict) else None
-                now_ts = time.time()
-                if isinstance(marker, dict) and now_ts - float(marker.get("ts") or 0) < 600:
-                    marker_ts = float(marker.get("ts") or now_ts)
-                    self._ensure_tv_postcheck_task(
-                        state,
-                        show_root,
-                        mode="season",
-                        season_dirs=[season_dir],
-                        reason="season_metadata_merged",
-                        batch_id=f"season_{season_dir.name}",
-                        due_ts=marker_ts + max(self._post_scrape_check_delay_minutes, 0) * 60,
-                    )
-                    logger.debug(f"监控strm刮削网盘：同一季信息刮削事件已合并：{season_dir}")
-                    continue
+            except Exception as err:
+                logger.debug(f"监控strm刮削网盘：检查季信息状态失败：{season_dir} - {err}")
+                continue
+            if season_status.get("complete"):
+                continue
 
-                season_episodes = [ep for ep in episode_paths if self._path_same_or_under(str(ep), str(season_dir))]
-                scrape_target = self._map_tv_scope_to_scrape_target(season_dir, season_episodes)
+            scrape_dir = Path(self._map_strm_path_to_scrape_path(str(season_dir)))
+            markers = state.setdefault("markers", {})
+            marker_key = f"tv_season_scrape::{season_dir}"
+            marker = markers.get(marker_key) if isinstance(markers, dict) else None
+            recent_marker = isinstance(marker, dict) and now_ts - float(marker.get("ts") or 0) < 600
+            season_episodes = [ep for ep in episode_paths if self._path_same_or_under(str(ep), str(season_dir))]
+            scrape_target = ""
+            ok = False
+            msg = ""
+            if recent_marker:
+                scrape_target = str(marker.get("target") or "")
                 if scrape_target:
-                    ok, msg = self._trigger_scrape(Path(scrape_target))
-                else:
-                    ok = False
-                    candidates = self._tv_scope_media_candidate_paths(season_dir, season_episodes)
-                    msg = "未在 MP 刮削目标目录中找到可用于季信息刮削的真实单集媒体文件，已跳过目录刮削。" + (f" 已尝试：{', '.join(candidates[:8])}" if candidates else "")
-                if ok and isinstance(markers, dict):
-                    markers[marker_key] = {"ts": now_ts, "time": self._now_iso(), "season_dir": str(season_dir), "target": str(scrape_target)}
-                season_result = {
+                    sent_targets.add(target_key(scrape_target))
+                marker_ts = float(marker.get("ts") or now_ts)
+                self._ensure_tv_postcheck_task(
+                    state,
+                    show_root,
+                    mode="season",
+                    season_dirs=[season_dir],
+                    reason="season_metadata_merged",
+                    batch_id=f"season_{season_dir.name}",
+                    due_ts=marker_ts + delay_seconds,
+                )
+                result = {
                     "time": self._now_iso(),
-                    "action": "tv_season_metadata_incomplete_scrape",
+                    "action": "tv_season_metadata_merge_existing_scrape",
                     "scope": str(season_dir),
                     "folder": str(scrape_target or scrape_dir),
-                    "scrape": ok,
-                    "scrape_msg": msg,
+                    "scrape": None,
+                    "scrape_msg": "同一季 10 分钟内已触发过季信息刮削，本次不重复发送；继续检查本批次单集。",
                     "metadata": season_status,
-                    "note": "当前季缺少季信息，已使用真实单集媒体文件触发季信息刮削；随后继续检查本次入库单集图片。" if ok else "当前季缺少季信息，但未找到可用于 MP 刮削的真实单集媒体文件；不会退回刮削 Season 目录。",
-                }
-                self._append_history(state, season_result)
-                if self._notify and not ok:
-                    self._send_notify(season_result)
-                if ok:
-                    self._ensure_tv_postcheck_task(
-                        state,
-                        show_root,
-                        mode="season",
-                        season_dirs=[season_dir],
-                        reason="after_season_scrape",
-                        batch_id=f"season_{season_dir.name}",
-                        due_ts=now_ts + max(self._post_scrape_check_delay_minutes, 0) * 60,
-                    )
-
-            missing_eps: List[Path] = []
-            existing_count = 0
-            deleted_total = 0
-            postcheck_batch_id = self._make_task_batch_id("postcheck")
-            for episode_strm in episode_paths:
-                episode_status = self._episode_image_status(episode_strm)
-                if episode_status.get("has_image"):
-                    existing_count += 1
-                    continue
-                missing_eps.append(episode_strm)
-                deleted = self._delete_episode_nfo(episode_strm)
-                deleted_total += deleted
-                self._ensure_episode_scrape_task(
-                    state,
-                    episode_strm,
-                    show_root,
-                    reason="initial_missing_image",
-                    deleted_nfo=deleted,
-                    postcheck_batch_id=postcheck_batch_id,
-                )
-
-            if missing_eps:
-                names = "、".join([self._episode_label(ep, show_root) for ep in missing_eps[:8]])
-                result = {
-                    "time": self._now_iso(), "action": "tv_episode_missing_image_schedule_scrape", "scope": str(show_root),
-                    "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
-                    "scrape_msg": f"本次合并入库 {len(episode_paths)} 集，其中 {len(missing_eps)} 集缺少对应图片，已删除同名 nfo {deleted_total} 个，{self._episode_scrape_delay_seconds:g} 秒后逐集刮削；单集刮削事件发送成功后再计时 10 分钟检查，仍缺图才加入 10 天复查。",
-                    "note": names,
-                    "missing_count": len(missing_eps),
-                    "existing_count": existing_count,
-                    **self._episode_history_payload(show_root, episode_paths, prefix="checked"),
-                    **self._episode_history_payload(show_root, missing_eps, prefix="missing"),
                 }
                 self._append_history(state, result)
-                return {"remove": True, **result}
+                continue
 
+            scrape_target = self._map_tv_scope_to_scrape_target(season_dir, season_episodes)
+            if scrape_target:
+                key = target_key(scrape_target)
+                if key and key in sent_targets:
+                    ok = True
+                    msg = f"本批次已使用同一真实单集媒体文件触发 MP 刮削：{scrape_target}；不重复发送季信息刮削事件。"
+                else:
+                    ok, msg = self._trigger_scrape(Path(scrape_target))
+                    if ok:
+                        sent_targets.add(key)
+            else:
+                candidates = self._tv_scope_media_candidate_paths(season_dir, season_episodes)
+                msg = "未在 MP 刮削目标目录中找到可用于季信息刮削的真实单集媒体文件，已跳过目录刮削。" + (f" 已尝试：{', '.join(candidates[:8])}" if candidates else "")
+
+            if ok and isinstance(markers, dict):
+                markers[marker_key] = {"ts": now_ts, "time": self._now_iso(), "season_dir": str(season_dir), "target": str(scrape_target)}
+            season_result = {
+                "time": self._now_iso(),
+                "action": "tv_season_metadata_incomplete_scrape",
+                "scope": str(season_dir),
+                "folder": str(scrape_target or scrape_dir),
+                "scrape": ok,
+                "scrape_msg": msg,
+                "metadata": season_status,
+                "note": "当前季缺少季信息，已用真实单集媒体文件触发/合并季信息刮削；随后继续检查本次入库单集图片。" if ok else "当前季缺少季信息，但未找到可用于 MP 刮削的真实单集媒体文件；不会退回刮削 Season 目录。",
+            }
+            self._append_history(state, season_result)
+            if self._notify and not ok:
+                self._send_notify(season_result)
+            if ok:
+                self._ensure_tv_postcheck_task(
+                    state,
+                    show_root,
+                    mode="season",
+                    season_dirs=[season_dir],
+                    reason="after_season_scrape",
+                    batch_id=f"season_{season_dir.name}",
+                    due_ts=postcheck_due_ts,
+                )
+
+        # 3. 对所有缺图集触发单集补刮削。已被剧/季信息刮削使用过的同一真实文件不重复发送，但仍加入 10 分钟检查。
+        scheduled_eps: List[Path] = []
+        shared_trigger_eps: List[Path] = []
+        target_missing_eps: List[Path] = []
+        for episode_strm in missing_eps:
+            target = episode_target_map.get(str(episode_strm), "")
+            key = target_key(target)
+            if key and key in sent_targets:
+                shared_trigger_eps.append(episode_strm)
+                continue
+            if not target:
+                target_missing_eps.append(episode_strm)
+            self._ensure_episode_scrape_task(
+                state,
+                episode_strm,
+                show_root,
+                reason="initial_missing_image",
+                deleted_nfo=deleted_map.get(str(episode_strm), 0),
+                postcheck_batch_id=postcheck_batch_id,
+            )
+            scheduled_eps.append(episode_strm)
+
+        if shared_trigger_eps:
+            self._ensure_tv_postcheck_task(
+                state,
+                show_root,
+                mode="episodes",
+                episodes=shared_trigger_eps,
+                reason="metadata_scrape_shared_episode_check",
+                batch_id=postcheck_batch_id,
+                due_ts=postcheck_due_ts,
+            )
+
+        if missing_eps:
+            names = "、".join([self._episode_label(ep, show_root) for ep in missing_eps[:8]])
+            extra_parts = []
+            if scheduled_eps:
+                extra_parts.append(f"已创建 {len(scheduled_eps)} 个单集刮削任务")
+            if shared_trigger_eps:
+                extra_parts.append(f"其中 {len(shared_trigger_eps)} 集已由剧/季信息刮削使用同一真实文件触发，不重复发送，只等待10分钟检查")
+            if target_missing_eps:
+                extra_parts.append(f"{len(target_missing_eps)} 集暂未找到真实媒体文件，后续单集任务会再次尝试并记录失败原因")
+            extra = "；" + "；".join(extra_parts) if extra_parts else ""
             result = {
-                "time": self._now_iso(), "action": "tv_episode_image_exists_skip_initial", "scope": str(show_root),
+                "time": self._now_iso(), "action": "tv_episode_missing_image_schedule_scrape", "scope": str(show_root),
                 "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
-                "scrape_msg": f"本次合并入库 {len(episode_paths)} 集均已有对应图片，跳过刮削；不加入 10 天复查队列。",
+                "scrape_msg": f"本次合并入库 {len(episode_paths)} 集，其中 {len(missing_eps)} 集缺少对应图片，已删除同名 nfo {deleted_total} 个；单集刮削事件发送成功后再计时 10 分钟检查，仍缺图才加入 10 天复查。{extra}",
+                "note": names,
+                "missing_count": len(missing_eps),
+                "existing_count": existing_count,
+                "deleted_nfo": deleted_total,
                 **self._episode_history_payload(show_root, episode_paths, prefix="checked"),
+                **self._episode_history_payload(show_root, missing_eps, prefix="missing"),
             }
             self._append_history(state, result)
             return {"remove": True, **result}
 
-        result = {"time": self._now_iso(), "action": "skip_unknown_media_type", "scope": raw_path, "folder": raw_path, "scrape": None, "scrape_msg": "无法判断电影/电视剧类型，已跳过"}
+        result = {
+            "time": self._now_iso(), "action": "tv_episode_image_exists_skip_initial", "scope": str(show_root),
+            "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
+            "scrape_msg": f"本次合并入库 {len(episode_paths)} 集均已有对应图片，跳过单集刮削；不加入 10 天复查队列。",
+            **self._episode_history_payload(show_root, episode_paths, prefix="checked"),
+        }
         self._append_history(state, result)
         return {"remove": True, **result}
 
