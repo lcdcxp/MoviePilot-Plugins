@@ -41,7 +41,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "1.6"
+    plugin_version = "1.7"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -1320,17 +1320,23 @@ class LocalMetadataCleaner(_PluginBase):
                         "scrape_msg": "同一剧名根目录 10 分钟内已成功触发过整剧刮削，本次入库事件已合并；按首次刮削成功时间 10 分钟后检查缺图集。",
                         "skip_history": True,
                     }
-                ok, msg = self._trigger_scrape(scrape_dir)
+                scrape_target = self._map_tv_scope_to_scrape_target(show_root, episode_paths)
+                if scrape_target:
+                    ok, msg = self._trigger_scrape(Path(scrape_target))
+                else:
+                    ok = False
+                    candidates = self._tv_scope_media_candidate_paths(show_root, episode_paths)
+                    msg = "未在 MP 刮削目标目录中找到可用于整剧刮削的真实单集媒体文件，已跳过目录刮削。" + (f" 已尝试：{', '.join(candidates[:8])}" if candidates else "")
                 if ok and isinstance(markers, dict):
                     # 只有成功发出 MP 刮削事件后才写入去重标记，避免失败后重新入库被误判为已刮削。
-                    markers[marker_key] = {"ts": now_ts, "time": self._now_iso(), "show_root": str(show_root)}
+                    markers[marker_key] = {"ts": now_ts, "time": self._now_iso(), "show_root": str(show_root), "target": str(scrape_target)}
                 result = {
-                    "time": self._now_iso(), "action": "tv_root_no_metadata_scrape_whole_show", "scope": str(show_root), "folder": str(scrape_dir),
+                    "time": self._now_iso(), "action": "tv_root_no_metadata_scrape_whole_show", "scope": str(show_root), "folder": str(scrape_target or scrape_dir),
                     "scrape": ok, "scrape_msg": msg, "metadata": root_status,
                     "note": (
-                        f"剧名根目录没有任何图片/nfo，已触发整部剧刮削；本次入库范围固定为当前季/当前批次 {len(episode_paths)} 集，后续只检查这批集数，缺图集再加入 10 天复查队列。"
+                        f"剧名根目录没有任何图片/nfo，已使用真实单集媒体文件触发整剧刮削；本次入库范围固定为当前季/当前批次 {len(episode_paths)} 集，后续只检查这批集数，缺图集再加入 10 天复查队列。"
                         if ok else
-                        "剧名根目录没有任何图片/nfo，但整部剧刮削触发失败；未写入去重标记，后续重新入库或立即运行可再次尝试。"
+                        "剧名根目录没有任何图片/nfo，但未找到可用于 MP 刮削的真实单集媒体文件；不会退回刮削剧名目录，后续重新入库或立即运行可再次尝试。"
                     ),
                     **self._episode_history_payload(show_root, episode_paths, prefix="checked"),
                 }
@@ -1374,18 +1380,25 @@ class LocalMetadataCleaner(_PluginBase):
                     logger.debug(f"监控strm刮削网盘：同一季信息刮削事件已合并：{season_dir}")
                     continue
 
-                ok, msg = self._trigger_scrape(scrape_dir)
+                season_episodes = [ep for ep in episode_paths if self._path_same_or_under(str(ep), str(season_dir))]
+                scrape_target = self._map_tv_scope_to_scrape_target(season_dir, season_episodes)
+                if scrape_target:
+                    ok, msg = self._trigger_scrape(Path(scrape_target))
+                else:
+                    ok = False
+                    candidates = self._tv_scope_media_candidate_paths(season_dir, season_episodes)
+                    msg = "未在 MP 刮削目标目录中找到可用于季信息刮削的真实单集媒体文件，已跳过目录刮削。" + (f" 已尝试：{', '.join(candidates[:8])}" if candidates else "")
                 if ok and isinstance(markers, dict):
-                    markers[marker_key] = {"ts": now_ts, "time": self._now_iso(), "season_dir": str(season_dir)}
+                    markers[marker_key] = {"ts": now_ts, "time": self._now_iso(), "season_dir": str(season_dir), "target": str(scrape_target)}
                 season_result = {
                     "time": self._now_iso(),
                     "action": "tv_season_metadata_incomplete_scrape",
                     "scope": str(season_dir),
-                    "folder": str(scrape_dir),
+                    "folder": str(scrape_target or scrape_dir),
                     "scrape": ok,
                     "scrape_msg": msg,
                     "metadata": season_status,
-                    "note": "当前季缺少季信息，已触发当前季目录刮削；随后继续检查本次入库单集图片。" if ok else "当前季缺少季信息，但季目录刮削触发失败。",
+                    "note": "当前季缺少季信息，已使用真实单集媒体文件触发季信息刮削；随后继续检查本次入库单集图片。" if ok else "当前季缺少季信息，但未找到可用于 MP 刮削的真实单集媒体文件；不会退回刮削 Season 目录。",
                 }
                 self._append_history(state, season_result)
                 if self._notify and not ok:
@@ -2480,6 +2493,59 @@ class LocalMetadataCleaner(_PluginBase):
         except Exception as err:
             logger.debug(f"监控strm刮削网盘：查找电影真实媒体失败：{scrape_dir} - {err}")
         return ""
+
+    def _map_tv_scope_to_scrape_target(self, scope_dir: Path, episodes: List[Path] = None) -> str:
+        """电视剧整剧/季信息补刮削时，优先使用范围内真实单集视频文件。
+
+        不再直接刮削剧名目录或 Season 目录，避免部分 MP 版本对目录 get_file_item 失败。
+        """
+        scope_dir = Path(scope_dir)
+        episodes = self._unique_episode_paths(episodes or [])
+
+        # 先使用本次入库快照里的 STRM，确保第一季/第二季互不影响。
+        for episode in episodes:
+            try:
+                if scope_dir and str(scope_dir) and not self._path_same_or_under(str(episode), str(scope_dir)):
+                    continue
+            except Exception:
+                pass
+            target = self._map_episode_strm_to_scrape_target(episode)
+            if target:
+                return target
+
+        # 快照里没有可用真实文件时，再在映射后的范围目录里找第一个真实媒体文件兜底。
+        mapped_dir = Path(self._map_strm_path_to_scrape_path(str(scope_dir)))
+        try:
+            if not mapped_dir.exists() or not mapped_dir.is_dir():
+                return ""
+            for root, dirs, files in os.walk(mapped_dir, followlinks=False):
+                root_path = Path(root)
+                dirs[:] = [
+                    d for d in dirs
+                    if not (root_path / d).is_symlink()
+                    and d.lower() not in {"sample", "samples", "trailer", "trailers", "extras"}
+                ]
+                for name in sorted(files, key=lambda x: x.lower()):
+                    lowered = name.lower()
+                    if any(x in lowered for x in ["sample", "trailer"]):
+                        continue
+                    candidate = root_path / name
+                    if candidate.is_file() and candidate.suffix.lower() in self._media_suffixes():
+                        return str(candidate)
+        except Exception as err:
+            logger.debug(f"监控strm刮削网盘：查找电视剧范围真实媒体失败：{mapped_dir} - {err}")
+        return ""
+
+    def _tv_scope_media_candidate_paths(self, scope_dir: Path, episodes: List[Path] = None) -> List[str]:
+        """返回整剧/季信息补刮削可能尝试的真实单集文件路径，用于失败说明。"""
+        candidates: List[str] = []
+        for episode in self._unique_episode_paths(episodes or [])[:3]:
+            candidates.extend(self._episode_media_candidate_paths(episode)[:3])
+        mapped_dir = Path(self._map_strm_path_to_scrape_path(str(scope_dir)))
+        text = f"{mapped_dir}/**/*{next(iter(self._media_suffixes()), '.mkv')}"
+        if text not in candidates:
+            candidates.append(text)
+        return candidates
 
     def _episode_media_candidate_paths(self, episode_strm: Path) -> List[str]:
         """返回单集 STRM 映射到 CD2 后会尝试查找的同名视频路径。"""
