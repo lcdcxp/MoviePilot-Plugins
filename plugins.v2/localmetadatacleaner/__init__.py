@@ -41,7 +41,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "2.1"
+    plugin_version = "2.2"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -56,6 +56,7 @@ class LocalMetadataCleaner(_PluginBase):
     DEFAULT_POST_SCRAPE_CHECK_MINUTES = 10
     DEFAULT_TV_RECHECK_DAYS = 10
     DEFAULT_MOVIE_RETRY_DELAYS_SECONDS = [30, 120, 300, 900, 3600]
+    DEFAULT_SCRAPE_PATH_REFRESH_INTERVAL_SECONDS = 600
     DEFAULT_TARGET_DEPTH = 3
     DEFAULT_STORAGE = "local"
     HISTORY_LIMIT = 100
@@ -66,6 +67,7 @@ class LocalMetadataCleaner(_PluginBase):
         "waiting_episode_scrape": "等待单集刮削",
         "waiting_tv_postcheck": "等待刮削后检查",
         "waiting_tv_recheck": "等待10天复查",
+        "waiting_tv_metadata_retry": "等待剧季路径重试",
     }
     TASK_TYPE_LABELS = {
         "initial": "入库检查",
@@ -73,6 +75,7 @@ class LocalMetadataCleaner(_PluginBase):
         "episode_scrape": "单集刮削",
         "tv_postcheck": "刮削后检查",
         "tv_recheck": "10天复查",
+        "tv_metadata_retry": "剧季重试",
     }
     TASK_COLORS = {
         "initial": "primary",
@@ -80,6 +83,7 @@ class LocalMetadataCleaner(_PluginBase):
         "episode_scrape": "purple",
         "tv_postcheck": "info",
         "tv_recheck": "warning",
+        "tv_metadata_retry": "orange",
     }
     ACTION_LABELS = {
         "movie_complete_skip": "电影完整跳过",
@@ -111,6 +115,12 @@ class LocalMetadataCleaner(_PluginBase):
         "movie_retry_scrape_success": "电影重试成功",
         "movie_retry_scrape_wait": "电影继续等待",
         "movie_retry_scrape_failed": "电影重试失败",
+        "tv_metadata_retry_scheduled": "剧季等待重试",
+        "tv_metadata_retry_success": "剧季重试成功",
+        "tv_metadata_retry_wait": "剧季继续等待",
+        "tv_metadata_retry_failed": "剧季重试失败",
+        "episode_scrape_retry_wait": "单集继续等待",
+        "episode_scrape_retry_failed": "单集重试失败",
         "episode_scrape_target_missing": "单集刮削文件缺失",
         "tv_recheck_missing_episodes_schedule_scrape": "10天复查缺图",
         "tv_recheck_complete": "10天复查完成",
@@ -152,6 +162,7 @@ class LocalMetadataCleaner(_PluginBase):
     # 刮削配置
     _scrape: bool = True
     _storage: str = DEFAULT_STORAGE
+    _scrape_path_refresh_interval_seconds: float = DEFAULT_SCRAPE_PATH_REFRESH_INTERVAL_SECONDS
 
     # 队列操作
     _queue_delete_items: List[str] = []
@@ -163,11 +174,14 @@ class LocalMetadataCleaner(_PluginBase):
     _timers: List[Timer] = []
     _next_timer_due_ts: float = 0
     _storagechain = None
+    _scrape_path_refresh_cache: Dict[str, float] = {}
     mschain = None
     mediaserver_helper = None
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
+        if not isinstance(getattr(self, "_scrape_path_refresh_cache", None), dict):
+            self._scrape_path_refresh_cache = {}
         try:
             self.mschain = MediaServerChain() if MediaServerChain else None
         except Exception as err:
@@ -206,6 +220,13 @@ class LocalMetadataCleaner(_PluginBase):
             self._post_scrape_check_delay_minutes = self.DEFAULT_POST_SCRAPE_CHECK_MINUTES
             self._tv_recheck_days = self._to_float(config.get("tv_recheck_days"), self.DEFAULT_TV_RECHECK_DAYS)
             self._scrape = bool(config.get("scrape", True))
+            self._scrape_path_refresh_interval_seconds = max(
+                self._to_float(
+                    config.get("scrape_path_refresh_interval_seconds"),
+                    self.DEFAULT_SCRAPE_PATH_REFRESH_INTERVAL_SECONDS
+                ),
+                0
+            )
             # 页面不再显示存储标识，普通本地映射固定使用 local。
             self._storage = self.DEFAULT_STORAGE
 
@@ -380,9 +401,10 @@ class LocalMetadataCleaner(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "episode_scrape_delay_seconds", "label": "单集刮削等待秒", "placeholder": "30"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "tv_recheck_days", "label": "复查天数", "placeholder": "10"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "scrape", "label": "触发 MP 刮削"}}]}
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "episode_scrape_delay_seconds", "label": "单集刮削等待秒", "placeholder": "30"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "scrape_path_refresh_interval_seconds", "label": "刮削前刷新间隔秒", "placeholder": "600"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "tv_recheck_days", "label": "复查天数", "placeholder": "10"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "scrape", "label": "触发 MP 刮削"}}]}
                         ]
                     },
                     {
@@ -408,6 +430,7 @@ class LocalMetadataCleaner(_PluginBase):
             "cron": self.DEFAULT_CRON,
             "initial_check_delay_seconds": self.DEFAULT_INITIAL_CHECK_DELAY_SECONDS,
             "episode_scrape_delay_seconds": self.DEFAULT_EPISODE_SCRAPE_DELAY_SECONDS,
+            "scrape_path_refresh_interval_seconds": self.DEFAULT_SCRAPE_PATH_REFRESH_INTERVAL_SECONDS,
             "tv_recheck_days": self.DEFAULT_TV_RECHECK_DAYS,
             "scrape": True,
             "queue_delete_items": [],
@@ -624,21 +647,6 @@ class LocalMetadataCleaner(_PluginBase):
         ]}
 
     @staticmethod
-    def _path_metric(label: str, value: str) -> Dict[str, Any]:
-        return {"component": "VCol", "props": {"cols": 12, "sm": 6}, "content": [
-            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": label},
-            {"component": "VSheet", "props": {"class": "pa-2 rounded-lg text-caption", "color": "grey-lighten-4"}, "text": value}
-        ]}
-
-    def _overview_text(self, last_record: Dict[str, Any]) -> str:
-        if not last_record:
-            return "等待 MP 全局 Webhook 入库事件。"
-        t = str(last_record.get("time") or "")
-        action = self._action_label(str(last_record.get("action") or ""))
-        scope = self._short_path(str(last_record.get("scope") or last_record.get("folder") or ""))
-        return f"最近处理：{t} · {action} · {scope}" if scope else f"最近处理：{t} · {action}"
-
-    @staticmethod
     def _queue_stats(queue: Dict[str, Any]) -> Dict[str, int]:
         stats: Dict[str, int] = {}
         for item in (queue or {}).values():
@@ -694,12 +702,13 @@ class LocalMetadataCleaner(_PluginBase):
         configs = {
             "initial": {"label": "等待入库检查", "icon": "mdi-magnify-scan", "desc": "下一步会检查 STRM 目录刮削信息，缺失时再触发电影/电视剧刮削。"},
             "movie_retry": {"label": "等待电影文件重试", "icon": "mdi-movie-search-outline", "desc": "下一步会继续尝试 CD2 同名真实视频文件；仍不可见则按短期重试间隔继续等待。"},
+            "tv_metadata_retry": {"label": "等待剧/季路径重试", "icon": "mdi-folder-refresh-outline", "desc": "下一步会继续预热 CD2 剧名目录或 Season 目录；就绪后触发目录刮削。"},
             "episode_scrape": {"label": "等待刮削任务", "icon": "mdi-play-circle-outline", "desc": "下一步会触发真实媒体文件刮削；成功后再创建10分钟检查。"},
             "tv_postcheck": {"label": "等待10分钟检查", "icon": "mdi-timer-check-outline", "desc": "下一步会确认图片/季信息是否已生成；提前手动检查仍缺图时会保留原到期时间。"},
             "tv_recheck": {"label": "等待10天复查", "icon": "mdi-calendar-clock", "desc": "下一步会再次确认缺图集，仍缺图才删除同名 nfo 并重新排单集刮削。"},
             "other": {"label": "其他任务", "icon": "mdi-dots-horizontal-circle-outline", "desc": "未知或兼容旧版本的任务。"},
         }
-        order = ["initial", "movie_retry", "episode_scrape", "tv_postcheck", "tv_recheck", "other"]
+        order = ["initial", "movie_retry", "tv_metadata_retry", "episode_scrape", "tv_postcheck", "tv_recheck", "other"]
         bucket = {key: {**configs[key], "type": key, "items": [], "task_count": 0} for key in order}
         for display in display_items or []:
             task_type = self._display_task_type(display)
@@ -743,7 +752,9 @@ class LocalMetadataCleaner(_PluginBase):
                 return "检查本次涉及季的 season 海报、Season 目录 poster 和 season.nfo；仍缺失时记录异常但不提前进入10天复查。"
             return "检查本批单集图片是否已生成；到期检查仍缺图时才加入10天复查，手动提前检查仍缺图会继续等待原时间。"
         if task_type == "tv_recheck":
-            return "重新确认缺图集；到期仍缺图时删除同名 nfo，并重新排单集刮削任务。"
+            return "重新确认缺图集；到期或手动立即复查时，仍缺图会删除同名 nfo，并重新排单集刮削任务。"
+        if task_type == "tv_metadata_retry":
+            return "重新预热/探测 CD2 剧名目录或 Season 目录；就绪后触发对应目录刮削。"
         return "按兼容逻辑处理该任务。"
 
     def _queue_display_card(self, display: Dict[str, Any]) -> Dict[str, Any]:
@@ -867,7 +878,7 @@ class LocalMetadataCleaner(_PluginBase):
             {"component": "div", "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-2"}, "content": [
                 {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium"}, "text": title},
                 {"component": "div", "props": {"class": "d-flex flex-wrap align-center ga-1"}, "content": chips + [
-                    {"component": "VBtn", "props": {"variant": "tonal", "color": "success" if task_type not in ("tv_postcheck", "tv_recheck") else "info", "size": "x-small", "prepend-icon": "mdi-play-circle-outline", "class": "ml-1"}, "text": "立即检查" if task_type in ("tv_postcheck", "tv_recheck") else "立即执行", "events": {"click": {"api": "plugin/LocalMetadataCleaner/queue_run", "method": "get", "params": {"key": key, "apikey": getattr(settings, "API_TOKEN", "")}}}},
+                    {"component": "VBtn", "props": {"variant": "tonal", "color": "info" if task_type == "tv_postcheck" else ("warning" if task_type == "tv_recheck" else "success"), "size": "x-small", "prepend-icon": "mdi-play-circle-outline", "class": "ml-1"}, "text": ("立即检查" if task_type == "tv_postcheck" else ("立即复查" if task_type == "tv_recheck" else ("立即重试" if task_type in ("movie_retry", "tv_metadata_retry") else "立即执行"))), "events": {"click": {"api": "plugin/LocalMetadataCleaner/queue_run", "method": "get", "params": {"key": key, "apikey": getattr(settings, "API_TOKEN", "")}}}},
                     {"component": "VBtn", "props": {"variant": "tonal", "color": "error", "size": "x-small", "prepend-icon": "mdi-delete-outline", "class": "ml-1"}, "text": "删除任务", "events": {"click": {"api": "plugin/LocalMetadataCleaner/queue_delete", "method": "get", "params": {"key": key, "apikey": getattr(settings, "API_TOKEN", "")}}}}
                 ]}
             ]},
@@ -1206,6 +1217,8 @@ class LocalMetadataCleaner(_PluginBase):
             return self._process_initial_task(task, state)
         if task_type == "movie_retry":
             return self._process_movie_retry_task(task, state, manual=manual)
+        if task_type == "tv_metadata_retry":
+            return self._process_tv_metadata_retry_task(task, state, manual=manual)
         if task_type == "episode_scrape":
             return self._process_episode_scrape_task(task, state)
         if task_type == "tv_postcheck":
@@ -1477,6 +1490,234 @@ class LocalMetadataCleaner(_PluginBase):
         return result or [30, 120, 300, 900, 3600]
 
 
+
+    def _tv_cd2_retry_delays(self) -> List[float]:
+        """电视剧 CD2 就绪重试沿用电影短期重试节奏。"""
+        return self._movie_retry_delays()
+
+    def _advance_retry_task(self, task: Dict[str, Any], delays: List[float], reason: str = "") -> Tuple[bool, float, int]:
+        """推进短期重试任务。返回：(是否还有下次, due_ts, retry_count)。"""
+        raw_retry_index = task.get("retry_index")
+        if raw_retry_index is None or raw_retry_index == "":
+            # movie_retry / tv_metadata_retry 创建时已经用过第 0 档延迟；
+            # episode_scrape 的初始等待只是刮削前等待，不算 CD2 重试，
+            # 所以第一次失败后仍从 30 秒这一档开始。
+            retry_index = -1 if str(task.get("task_type") or "") == "episode_scrape" else 0
+        else:
+            retry_index = int(raw_retry_index or 0)
+        retry_count = int(task.get("retry_count") or 0) + 1
+        if retry_index + 1 < len(delays):
+            next_index = retry_index + 1
+            next_delay = float(delays[next_index])
+            due_ts = time.time() + next_delay
+            task["retry_index"] = next_index
+            task["retry_count"] = retry_count
+            task["due_ts"] = due_ts
+            task["due_at"] = self._ts_to_str(due_ts)
+            if reason:
+                task["last_reason"] = reason
+            self._schedule_delayed_check_until(due_ts)
+            return True, due_ts, retry_count
+        task["retry_count"] = retry_count
+        if reason:
+            task["last_reason"] = reason
+        return False, 0, retry_count
+
+    def _ensure_tv_metadata_retry_task(
+        self,
+        state: Dict[str, Any],
+        show_root: Path,
+        scope_dir: Path,
+        purpose: str = "剧/季信息",
+        mode: str = "root",
+        season_dirs: List[Path] = None,
+        episodes: List[Path] = None,
+        reason: str = "",
+        batch_id: str = "",
+        postcheck_on_missing: str = "",
+    ):
+        """剧名目录/Season 目录在 CD2 暂不可访问时，创建短期就绪重试任务。"""
+        queue = state.setdefault("queue", {})
+        mode = str(mode or "root")
+        key = f"tv_metadata_retry::{mode}::{scope_dir}"
+        delays = self._tv_cd2_retry_delays()
+        first_delay = delays[0] if delays else 30
+        due_ts = time.time() + first_delay
+        existing = queue.get(key)
+        season_strings = [str(x) for x in (season_dirs or []) if str(x or "").strip()]
+        episode_strings = [str(x) for x in self._unique_episode_paths(episodes or [])]
+        if isinstance(existing, dict):
+            old_due = float(existing.get("due_ts") or 0)
+            if old_due and old_due > time.time():
+                due_ts = old_due
+            old_eps = self._to_list(existing.get("episodes") or [])
+            for ep in episode_strings:
+                if ep not in old_eps:
+                    old_eps.append(ep)
+            old_seasons = self._to_list(existing.get("season_dirs") or [])
+            for sd in season_strings:
+                if sd not in old_seasons:
+                    old_seasons.append(sd)
+            existing.update({
+                "show_root": str(show_root),
+                "scope_dir": str(scope_dir),
+                "purpose": str(purpose or existing.get("purpose") or "剧/季信息"),
+                "mode": mode,
+                "season_dirs": old_seasons,
+                "episodes": old_eps,
+                "batch_id": str(batch_id or existing.get("batch_id") or ""),
+                "postcheck_on_missing": str(postcheck_on_missing or existing.get("postcheck_on_missing") or ""),
+                "due_ts": due_ts,
+                "due_at": self._ts_to_str(due_ts),
+                "status": "waiting_tv_metadata_retry",
+                "last_reason": reason or existing.get("last_reason") or "CD2 目录暂未就绪",
+                "last_msg": f"CD2 剧/季目录暂未就绪，等待重试；下次检查：{self._ts_to_str(due_ts)}",
+            })
+        else:
+            queue[key] = {
+                "task_type": "tv_metadata_retry",
+                "key": key,
+                "show_root": str(show_root),
+                "scope_dir": str(scope_dir),
+                "purpose": str(purpose or "剧/季信息"),
+                "mode": mode,
+                "season_dirs": season_strings,
+                "episodes": episode_strings,
+                "batch_id": str(batch_id or self._make_task_batch_id("tvmeta")),
+                "postcheck_on_missing": str(postcheck_on_missing or ""),
+                "retry_index": 0,
+                "retry_count": 0,
+                "first_seen_ts": time.time(),
+                "first_seen": self._now_iso(),
+                "due_ts": due_ts,
+                "due_at": self._ts_to_str(due_ts),
+                "status": "waiting_tv_metadata_retry",
+                "last_reason": reason or "CD2 目录暂未就绪",
+                "last_msg": f"CD2 剧/季目录暂未就绪，等待 {first_delay:g} 秒后重试",
+            }
+        self._schedule_delayed_check_until(due_ts)
+
+    def _process_tv_metadata_retry_task(self, task: Dict[str, Any], state: Dict[str, Any], manual: bool = False) -> Dict[str, Any]:
+        show_root = Path(str(task.get("show_root") or ""))
+        scope_dir = Path(str(task.get("scope_dir") or ""))
+        purpose = str(task.get("purpose") or "剧/季信息")
+        mode = str(task.get("mode") or "root")
+        refresh_batch = set()
+        episode_paths = self._unique_episode_paths([Path(x) for x in self._to_list(task.get("episodes") or [])])
+        ok, msg, scrape_target, _used_file_fallback = self._trigger_tv_metadata_scrape(
+            scope_dir,
+            episode_paths,
+            purpose=purpose,
+            refresh_batch=refresh_batch,
+        )
+        if ok:
+            due_ts = time.time() + max(self._post_scrape_check_delay_minutes, 0) * 60
+            # 目录刮削成功后，这些集先等目录刮削后的 10 分钟检查；
+            # 移除仍在等待的单集刮削任务，避免目录刮削和单集刮削重复触发。
+            queue = state.setdefault("queue", {})
+            for ep in episode_paths:
+                queue.pop(f"episode::{ep}", None)
+            if episode_paths:
+                self._ensure_tv_postcheck_task(
+                    state,
+                    show_root,
+                    mode="episodes",
+                    episodes=episode_paths,
+                    reason="tv_metadata_retry_success_wait_episode_check",
+                    batch_id=str(task.get("batch_id") or self._make_task_batch_id("metaeps")),
+                    due_ts=due_ts,
+                    on_missing="episode_scrape",
+                )
+            removed_season_retry = 0
+            if mode == "season":
+                season_dirs = [Path(x) for x in self._to_list(task.get("season_dirs") or [])] or [scope_dir]
+                self._ensure_tv_postcheck_task(
+                    state,
+                    show_root,
+                    mode="season",
+                    season_dirs=season_dirs,
+                    reason="after_tv_metadata_retry_success",
+                    batch_id=str(task.get("batch_id") or self._make_task_batch_id("seasonretry")),
+                    due_ts=due_ts,
+                )
+            else:
+                self._ensure_tv_postcheck_task(
+                    state,
+                    show_root,
+                    mode="root",
+                    reason="after_tv_metadata_retry_success",
+                    batch_id="root",
+                    due_ts=due_ts,
+                )
+                # root 目录重试成功后，整剧目录刮削会覆盖本次剧下 Season；
+                # 删除同剧仍在等待的 Season 重试，避免后续重复刮削。
+                season_dirs = self._unique_season_dirs(episode_paths, show_root)
+                if season_dirs:
+                    self._ensure_tv_postcheck_task(
+                        state,
+                        show_root,
+                        mode="season",
+                        season_dirs=season_dirs,
+                        reason="after_root_tv_metadata_retry_success",
+                        batch_id=str(task.get("batch_id") or self._make_task_batch_id("rootseason")),
+                        due_ts=due_ts,
+                    )
+                current_key = str(task.get("key") or "")
+                for qkey, qtask in list(queue.items()):
+                    if qkey == current_key or not isinstance(qtask, dict):
+                        continue
+                    if str(qtask.get("task_type") or "") != "tv_metadata_retry":
+                        continue
+                    if str(qtask.get("mode") or "") != "season":
+                        continue
+                    q_show = str(qtask.get("show_root") or "")
+                    q_scope = str(qtask.get("scope_dir") or "")
+                    if q_show == str(show_root) or self._path_same_or_under(q_scope, str(show_root)):
+                        queue.pop(qkey, None)
+                        removed_season_retry += 1
+            result = {
+                "time": self._now_iso(),
+                "action": "tv_metadata_retry_success",
+                "scope": str(scope_dir),
+                "folder": str(scrape_target),
+                "scrape": True,
+                "scrape_msg": f"{purpose}短期重试成功，已触发 MP 刮削事件。{msg}",
+                "note": ("已创建 10 分钟后检查任务。" + (f" 已清理同剧 Season 重试任务 {removed_season_retry} 个。" if removed_season_retry else "")),
+            }
+            self._append_history(state, result)
+            return {"remove": True, **result}
+
+        delays = self._tv_cd2_retry_delays()
+        has_next, due_ts, retry_count = self._advance_retry_task(task, delays, reason=msg)
+        if has_next:
+            task["status"] = "waiting_tv_metadata_retry"
+            task["last_msg"] = f"CD2 剧/季目录仍未就绪，等待下次重试：{self._ts_to_str(due_ts)}"
+            result = {
+                "time": self._now_iso(),
+                "action": "tv_metadata_retry_wait",
+                "scope": str(scope_dir),
+                "folder": self._map_strm_path_to_scrape_path(str(scope_dir)),
+                "scrape": None,
+                "scrape_msg": f"{purpose}目录仍未就绪，已安排下次重试：{self._ts_to_str(due_ts)}。",
+                "note": msg,
+            }
+            self._append_history(state, result)
+            return {"remove": False, **result}
+
+        result = {
+            "time": self._now_iso(),
+            "action": "tv_metadata_retry_failed",
+            "scope": str(scope_dir),
+            "folder": self._map_strm_path_to_scrape_path(str(scope_dir)),
+            "scrape": False,
+            "scrape_msg": f"{purpose}刮削失败：多次等待后 CD2 目录仍不可用或目录内真实媒体未就绪。",
+            "note": f"最后原因：{msg}；已重试 {retry_count} 次。",
+        }
+        self._append_history(state, result)
+        if self._notify:
+            self._send_notify(result)
+        return {"remove": True, **result}
+
     def _process_initial_tv_task(self, task: Dict[str, Any], state: Dict[str, Any], raw_path: str = "") -> Dict[str, Any]:
         """处理电视剧入库任务。
 
@@ -1500,6 +1741,7 @@ class LocalMetadataCleaner(_PluginBase):
         delay_seconds = max(self._post_scrape_check_delay_minutes, 0) * 60
         postcheck_due_ts = now_ts + delay_seconds
         sent_targets = set()
+        refresh_batch = set()
         episode_target_map: Dict[str, str] = {}
         # 剧/季目录刮削在 MP 原生流程里可能会同时处理目录下文件。
         # 为避免同一集在“目录刮削”和“单集刮削任务”里重复触发，
@@ -1509,13 +1751,6 @@ class LocalMetadataCleaner(_PluginBase):
 
         def target_key(value: str) -> str:
             return str(Path(str(value or ""))) if value else ""
-
-        for episode in episode_paths:
-            try:
-                episode_target_map[str(episode)] = self._map_episode_strm_to_scrape_target(episode) or ""
-            except Exception as err:
-                logger.debug(f"监控strm刮削网盘：查找单集真实媒体失败：{episode} - {err}")
-                episode_target_map[str(episode)] = ""
 
         # 先检查本次快照内的每一集是否已有图片。
         # 注意：这里不立即删除单集 nfo。若剧/季目录刮削会覆盖该集，先等待目录刮削后的10分钟检查；
@@ -1579,7 +1814,12 @@ class LocalMetadataCleaner(_PluginBase):
                 }
                 self._append_history(state, result)
             else:
-                ok, msg, scrape_target, used_file_fallback = self._trigger_tv_metadata_scrape(show_root, episode_paths, purpose="剧信息")
+                ok, msg, scrape_target, used_file_fallback = self._trigger_tv_metadata_scrape(
+                    show_root,
+                    episode_paths,
+                    purpose="剧信息",
+                    refresh_batch=refresh_batch,
+                )
                 if ok and isinstance(markers, dict):
                     markers[marker_key] = {"ts": now_ts, "time": self._now_iso(), "show_root": str(show_root), "target": str(scrape_target), "used_file_fallback": False}
                     self._ensure_tv_postcheck_task(
@@ -1603,9 +1843,23 @@ class LocalMetadataCleaner(_PluginBase):
                     ),
                     **self._episode_history_payload(show_root, episode_paths, prefix="checked"),
                 }
+                if not ok:
+                    self._ensure_tv_metadata_retry_task(
+                        state,
+                        show_root,
+                        show_root,
+                        purpose="剧信息",
+                        mode="root",
+                        episodes=episode_paths,
+                        reason=msg,
+                        batch_id="root",
+                        postcheck_on_missing="episode_scrape",
+                    )
+                    result["action"] = "tv_metadata_retry_scheduled"
+                    result["scrape"] = None
+                    result["scrape_msg"] = "剧名目录暂未就绪或目录内真实媒体未刷新，已加入 CD2 短期重试队列。"
+                    result["note"] = f"原始原因：{msg}；仍继续检查季信息和单集，插件不会立即判最终失败。"
                 self._append_history(state, result)
-                if self._notify and not ok:
-                    self._send_notify(result)
 
         # 2. 检查本次入库涉及的季信息。缺失时，按 MP 原生模式触发 Season 目录刮削。
         season_dirs = self._unique_season_dirs(episode_paths, show_root)
@@ -1678,7 +1932,12 @@ class LocalMetadataCleaner(_PluginBase):
                 self._append_history(state, result)
                 continue
 
-            ok, msg, scrape_target, used_file_fallback = self._trigger_tv_metadata_scrape(season_dir, season_episodes, purpose=f"季信息 {season_dir.name}")
+            ok, msg, scrape_target, used_file_fallback = self._trigger_tv_metadata_scrape(
+                season_dir,
+                season_episodes,
+                purpose=f"季信息 {season_dir.name}",
+                refresh_batch=refresh_batch,
+            )
 
             if ok and isinstance(markers, dict):
                 markers[marker_key] = {"ts": now_ts, "time": self._now_iso(), "season_dir": str(season_dir), "target": str(scrape_target), "used_file_fallback": False}
@@ -1692,9 +1951,23 @@ class LocalMetadataCleaner(_PluginBase):
                 "metadata": season_status,
                 "note": "当前季缺少季信息，已按 MP 原生模式触发 CD2 Season 目录刮削；随后继续检查本次入库单集图片。" if ok else "当前季缺少季信息，Season 目录刮削失败。",
             }
+            if not ok:
+                self._ensure_tv_metadata_retry_task(
+                    state,
+                    show_root,
+                    season_dir,
+                    purpose=f"季信息 {season_dir.name}",
+                    mode="season",
+                    season_dirs=[season_dir],
+                    episodes=season_episodes,
+                    reason=msg,
+                    batch_id=f"season_{season_dir.name}",
+                )
+                season_result["action"] = "tv_metadata_retry_scheduled"
+                season_result["scrape"] = None
+                season_result["scrape_msg"] = f"{season_dir.name} 目录暂未就绪或目录内真实媒体未刷新，已加入 CD2 短期重试队列。"
+                season_result["note"] = f"原始原因：{msg}；不会立即判最终失败。"
             self._append_history(state, season_result)
-            if self._notify and not ok:
-                self._send_notify(season_result)
             if ok:
                 self._ensure_tv_postcheck_task(
                     state,
@@ -1715,11 +1988,21 @@ class LocalMetadataCleaner(_PluginBase):
         target_missing_eps: List[Path] = []
         metadata_wait_set = {str(x) for x in self._unique_episode_paths(metadata_scrape_episodes)}
         for episode_strm in missing_eps:
-            target = episode_target_map.get(str(episode_strm), "")
-            key = target_key(target)
             if str(episode_strm) in metadata_wait_set:
                 metadata_wait_eps.append(episode_strm)
                 continue
+            target = episode_target_map.get(str(episode_strm))
+            if target is None:
+                try:
+                    target = self._map_episode_strm_to_scrape_target(
+                        episode_strm,
+                        refresh_batch=refresh_batch,
+                    ) or ""
+                except Exception as err:
+                    logger.debug(f"监控strm刮削网盘：查找单集真实媒体失败：{episode_strm} - {err}")
+                    target = ""
+                episode_target_map[str(episode_strm)] = target
+            key = target_key(target)
             if key and key in sent_targets:
                 shared_trigger_eps.append(episode_strm)
                 continue
@@ -1791,6 +2074,7 @@ class LocalMetadataCleaner(_PluginBase):
     def _process_episode_scrape_task(self, task: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
         episode_strm = Path(str(task.get("episode_strm") or ""))
         show_root = Path(str(task.get("show_root") or ""))
+        refresh_batch = set()
 
         # 兼容旧队列：历史版本可能把 scrape_target 保存成 .strm 路径。
         # 单集刮削必须使用 CD2 中的真实视频文件，不能刮削 .strm，也不能退回 Season 目录。
@@ -1798,31 +2082,64 @@ class LocalMetadataCleaner(_PluginBase):
         target = ""
         if stored_target:
             stored_path = Path(stored_target)
-            if stored_path.suffix.lower() in self._media_suffixes() and stored_path.exists() and stored_path.is_file():
+            if not self._is_safe_episode_scrape_file(stored_path):
+                logger.debug(f"监控strm刮削网盘：忽略旧队列中的非 CD2 单集刮削目标，重新查找同名真实媒体：{stored_target}")
+            elif stored_path.exists() and stored_path.is_file():
                 target = stored_target
-            elif stored_path.suffix.lower() == ".strm":
-                logger.debug(f"监控strm刮削网盘：忽略旧队列中的 STRM 刮削目标，重新查找同名真实媒体：{stored_target}")
+            else:
+                stored_ready, _ = self._ensure_scrape_path_refreshed(stored_path, reason="单集刮削文件检查", refresh_batch=refresh_batch)
+                if stored_ready or (stored_path.exists() and stored_path.is_file()):
+                    target = stored_target
 
         if not target:
-            target = self._map_episode_strm_to_scrape_target(episode_strm)
+            target = self._map_episode_strm_to_scrape_target(episode_strm, refresh_batch=refresh_batch)
 
         if not target:
             mapped = Path(self._map_strm_path_to_scrape_path(str(episode_strm)))
             candidates = self._episode_media_candidate_paths(episode_strm)
+            delays = self._tv_cd2_retry_delays()
+            has_next, due_ts, retry_count = self._advance_retry_task(task, delays, reason="单集真实媒体文件暂未就绪")
+            if has_next:
+                task["status"] = "waiting_episode_scrape"
+                task["scrape_target"] = ""
+                task["last_msg"] = f"单集真实媒体文件暂未就绪，等待下次重试：{self._ts_to_str(due_ts)}"
+                result = {
+                    "time": self._now_iso(), "action": "episode_scrape_retry_wait", "scope": str(episode_strm), "folder": str(mapped.parent if mapped.suffix.lower() == ".strm" else mapped),
+                    "scrape": None,
+                    "scrape_msg": f"未在 CD2 目标目录找到同名单集真实媒体文件，已安排短期重试：{self._ts_to_str(due_ts)}。",
+                    "deleted_nfo": int(task.get("deleted_nfo") or 0),
+                    "note": "插件不会刮削 .strm 文件；已按同名视频文件规则查找 mkv/mp4/ts/iso 等格式。" + (f" 已尝试：{', '.join(candidates[:5])}" if candidates else " 未生成候选路径。"),
+                }
+                self._append_history(state, result)
+                return {"remove": False, **result}
             result = {
-                "time": self._now_iso(), "action": "episode_scrape_target_missing", "scope": str(episode_strm), "folder": str(mapped.parent if mapped.suffix.lower() == ".strm" else mapped),
+                "time": self._now_iso(), "action": "episode_scrape_retry_failed", "scope": str(episode_strm), "folder": str(mapped.parent if mapped.suffix.lower() == ".strm" else mapped),
                 "scrape": False,
-                "scrape_msg": "未在 MP 刮削目标目录中找到单集真实媒体文件，已跳过；不会退回刮削 Season 目录。",
+                "scrape_msg": "单集刮削失败：多次等待后仍未在 CD2 目标目录找到同名真实媒体文件；不会退回刮削 Season 目录。",
                 "deleted_nfo": int(task.get("deleted_nfo") or 0),
-                "note": "插件不会刮削 .strm 文件；已按同名视频文件规则查找 mkv/mp4/ts/iso 等格式。" + (f" 已尝试：{', '.join(candidates[:5])}" if candidates else " 未生成候选路径。")
+                "note": "插件不会刮削 .strm 文件；已按同名视频文件规则查找 mkv/mp4/ts/iso 等格式。" + (f" 已尝试：{', '.join(candidates[:8])}" if candidates else " 未生成候选路径。") + f" 已重试 {retry_count} 次。",
             }
             self._append_history(state, result)
             if self._notify:
                 self._send_notify(result)
             return {"remove": True, **result}
-        ok, msg = self._trigger_scrape(Path(str(target)))
+        target_path = Path(str(target))
+        if not self._is_safe_episode_scrape_file(target_path):
+            result = {
+                "time": self._now_iso(), "action": "episode_scrape_target_rejected", "scope": str(episode_strm), "folder": str(target_path),
+                "scrape": False,
+                "scrape_msg": f"单集刮削目标被安全规则拒绝：{target_path}",
+                "deleted_nfo": int(task.get("deleted_nfo") or 0),
+                "note": "单集刮削目标必须位于 CD2 刮削根路径下，不能位于 STRM 媒体库路径下，且必须是真实视频后缀。已移除该异常任务，避免旧队列误刮非 CD2 路径。"
+            }
+            self._append_history(state, result)
+            if self._notify:
+                self._send_notify(result)
+            return {"remove": True, **result}
+
+        ok, msg = self._trigger_scrape(target_path)
         result = {
-            "time": self._now_iso(), "action": "episode_delayed_scrape", "scope": str(episode_strm), "folder": str(target),
+            "time": self._now_iso(), "action": "episode_delayed_scrape", "scope": str(episode_strm), "folder": str(target_path),
             "scrape": ok, "scrape_msg": msg, "deleted_nfo": int(task.get("deleted_nfo") or 0),
             "note": str(task.get("reason") or "")
         }
@@ -1837,6 +2154,20 @@ class LocalMetadataCleaner(_PluginBase):
                 due_ts=time.time() + max(self._post_scrape_check_delay_minutes, 0) * 60,
             )
             result["postcheck_msg"] = "单集刮削事件已发送成功，已从当前时间开始计时 10 分钟后检查图片。"
+        if not ok:
+            delays = self._tv_cd2_retry_delays()
+            has_next, due_ts, retry_count = self._advance_retry_task(task, delays, reason=msg)
+            if has_next:
+                task["status"] = "waiting_episode_scrape"
+                task["scrape_target"] = str(target)
+                task["last_msg"] = f"单集真实媒体 fileitem 暂不可用，等待下次重试：{self._ts_to_str(due_ts)}"
+                result["action"] = "episode_scrape_retry_wait"
+                result["scrape"] = None
+                result["scrape_msg"] = f"单集真实媒体 fileitem 暂不可用，已安排短期重试：{self._ts_to_str(due_ts)}。原始原因：{msg}"
+                self._append_history(state, result)
+                return {"remove": False, **result}
+            result["action"] = "episode_scrape_retry_failed"
+            result["scrape_msg"] = f"单集刮削失败：多次等待后仍无法触发 MP 刮削。最后原因：{msg}；已重试 {retry_count} 次。"
         self._append_history(state, result)
         if self._notify and not ok:
             self._send_notify(result)
@@ -1894,10 +2225,22 @@ class LocalMetadataCleaner(_PluginBase):
                     incomplete.append((season_dir, status))
             if incomplete:
                 names = "、".join([f"{sd.name} 缺 {','.join(st.get('missing') or [])}" for sd, st in incomplete[:5]])
+                if not manual:
+                    for sd, _st in incomplete:
+                        self._ensure_tv_metadata_retry_task(
+                            state,
+                            show_root,
+                            sd,
+                            purpose=f"季信息 {sd.name}",
+                            mode="season",
+                            season_dirs=[sd],
+                            reason="季信息刮削后检查仍不完整，自动补触发 Season 目录刮削",
+                            batch_id=f"season_retry_{sd.name}",
+                        )
                 result = {
                     "time": self._now_iso(), "action": "tv_season_postcheck_manual_incomplete_keep_waiting" if manual else "tv_season_postcheck_incomplete", "scope": str(show_root),
                     "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
-                    "scrape_msg": (f"手动检查了 {checked_count} 个季目录，仍有 {len(incomplete)} 个季信息不完整；保留原任务到期后再检查。" if manual else f"季信息刮削后检查了 {checked_count} 个季目录，仍有 {len(incomplete)} 个季信息不完整；不会加入 10 天单集复查队列。"),
+                    "scrape_msg": (f"手动检查了 {checked_count} 个季目录，仍有 {len(incomplete)} 个季信息不完整；保留原任务到期后再检查。" if manual else f"季信息刮削后检查了 {checked_count} 个季目录，仍有 {len(incomplete)} 个季信息不完整；已自动加入 Season 目录短期重试/补刮削队列，不会加入 10 天单集复查队列。"),
                     "missing_count": len(incomplete), "note": names
                 }
                 task["last_msg"] = result["scrape_msg"]
@@ -2020,18 +2363,6 @@ class LocalMetadataCleaner(_PluginBase):
             result = {"time": self._now_iso(), "action": "tv_recheck_complete", "scope": str(show_root), "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None, "scrape_msg": f"10天复查完成，检查 {checked_count} 集，均已有对应图片", **self._episode_history_payload(show_root, checked_payload, prefix="checked")}
             self._append_history(state, result)
             return {"remove": True, **result}
-        if manual:
-            task["missing_preview"] = self._preview_from_episodes(show_root, missing, limit=8)
-            result = {
-                "time": self._now_iso(), "action": "tv_recheck_manual_missing_keep_waiting", "scope": str(show_root), "folder": self._map_strm_path_to_scrape_path(str(show_root)),
-                "scrape": None, "scrape_msg": f"手动10天复查检查 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片；保留原任务，不提前删除 nfo 或触发刮削。",
-                "missing_count": len(missing),
-                "note": "、".join([self._episode_label(ep, show_root) for ep in missing[:8]]),
-                **self._episode_history_payload(show_root, missing, prefix="missing"),
-            }
-            task["last_msg"] = result["scrape_msg"]
-            self._append_history(state, result)
-            return {"remove": False, **result}
         total_deleted = 0
         postcheck_batch_id = self._make_task_batch_id("recheck")
         for episode in missing:
@@ -2173,6 +2504,8 @@ class LocalMetadataCleaner(_PluginBase):
             "reason": reason,
             "deleted_nfo": int(deleted_nfo or 0),
             "postcheck_batch_id": str(postcheck_batch_id or self._make_task_batch_id("ep")),
+            "retry_index": -1,
+            "retry_count": 0,
             "first_seen_ts": time.time(),
             "first_seen": self._now_iso(),
             "due_ts": due_ts,
@@ -2396,7 +2729,7 @@ class LocalMetadataCleaner(_PluginBase):
                 if not isinstance(task, dict):
                     continue
                 task_type = str(task.get("task_type") or "")
-                if task_type not in {"initial", "movie_retry", "episode_scrape", "tv_postcheck"}:
+                if task_type not in {"initial", "movie_retry", "tv_metadata_retry", "episode_scrape", "tv_postcheck"}:
                     continue
                 due_ts = float(task.get("due_ts") or 0)
                 if not due_ts:
@@ -2520,24 +2853,46 @@ class LocalMetadataCleaner(_PluginBase):
         return {"complete": not missing, "missing": missing, "nfo_count": nfo_count, "images": image_map, "files": sorted(list(files))[:50]}
 
     def _tv_root_metadata_status(self, show_root: Path) -> Dict[str, Any]:
+        """检查剧名根目录是否已有剧级元数据。
+
+        只把 tvshow.nfo、根目录 nfo、poster/fanart/backdrop 等剧级图片算作剧信息；
+        排除 seasonXX-poster、season-poster 等季级图片，避免误判“剧信息已存在”。
+        """
         image_count = 0
         nfo_count = 0
         names: List[str] = []
+        root_image_count = 0
+        root_nfo_count = 0
         try:
             if show_root.exists() and show_root.is_dir():
                 for item in show_root.iterdir():
                     if not item.is_file():
                         continue
                     suffix = item.suffix.lower()
+                    stem = item.stem.lower()
                     if suffix in self._image_suffixes():
                         image_count += 1
                         names.append(item.name)
+                        if not stem.startswith("season") and (
+                            stem in {"poster", "folder", "cover", "fanart", "backdrop", "landscape", "clearlogo", "clearart"}
+                            or stem.startswith("poster") or stem.startswith("fanart") or stem.startswith("backdrop")
+                        ):
+                            root_image_count += 1
                     elif suffix == ".nfo":
                         nfo_count += 1
                         names.append(item.name)
+                        if stem not in {"season"} and not stem.startswith("season"):
+                            root_nfo_count += 1
         except Exception as err:
-            return {"has_any_metadata": False, "error": str(err), "image_count": image_count, "nfo_count": nfo_count}
-        return {"has_any_metadata": (image_count + nfo_count) > 0, "image_count": image_count, "nfo_count": nfo_count, "names": names[:50]}
+            return {"has_any_metadata": False, "error": str(err), "image_count": image_count, "nfo_count": nfo_count, "root_image_count": root_image_count, "root_nfo_count": root_nfo_count}
+        return {
+            "has_any_metadata": (root_image_count + root_nfo_count) > 0,
+            "image_count": image_count,
+            "nfo_count": nfo_count,
+            "root_image_count": root_image_count,
+            "root_nfo_count": root_nfo_count,
+            "names": names[:50],
+        }
 
     def _unique_season_dirs(self, episodes: List[Path], show_root: Path) -> List[Path]:
         """从本次入库单集中提取唯一季目录。
@@ -2867,37 +3222,239 @@ class LocalMetadataCleaner(_PluginBase):
         path_text = self._normalise_path_text(path_text)
         return self._map_root(path_text, self._strm_check_root, self._scrape_target_root)
 
-    def _map_strm_file_to_media_target(self, strm_path: Path) -> str:
+    def _scrape_refresh_scope_path(self, target: Path) -> Path:
+        path = Path(target)
+        suffix = path.suffix.lower()
+        # .strm 不是实际刮削目标，只预热它映射后的所在目录；
+        # 真实媒体文件必须按文件路径自身做就绪判断，不能降级成父目录，
+        # 否则父目录有其它文件时会误缓存“已就绪”。
+        if suffix == ".strm":
+            return path.parent
+        return path
+
+    def _scrape_refresh_probe_paths(self, scope: Path) -> List[Path]:
+        result: List[Path] = []
+        seen = set()
+        scrape_root = self._normalise_path_text(self._scrape_target_root or self.DEFAULT_SCRAPE_TARGET_ROOT).rstrip("/")
+        current = Path(scope)
+        for _ in range(3):
+            text = self._normalise_path_text(str(current)).rstrip("/")
+            if text and text.lower() not in seen and (not scrape_root or self._path_same_or_under(text, scrape_root)):
+                seen.add(text.lower())
+                result.append(current)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+        return result
+
+    def _get_storagechain(self):
+        if StorageChain is None:
+            return None
+        if self._storagechain is None:
+            self._storagechain = StorageChain()
+        return self._storagechain
+
+    def _call_storage_path_method(self, chain: Any, method_name: str, path: Path) -> Tuple[bool, str]:
+        func = getattr(chain, method_name, None)
+        if not callable(func):
+            return False, ""
+        attempts = (
+            lambda: func(storage=self._storage, path=path),
+            lambda: func(path=path, storage=self._storage),
+            lambda: func(self._storage, path),
+            lambda: func(path),
+            lambda: func(str(path)),
+        )
+        last_err = ""
+        for attempt in attempts:
+            try:
+                value = attempt()
+                lower_name = method_name.lower()
+                if any(token in lower_name for token in ("list", "files", "items")):
+                    if value:
+                        return True, f"{method_name}({path})"
+                    last_err = f"{method_name}({path}) 返回空结果"
+                    continue
+                if value is False:
+                    last_err = f"{method_name}({path}) 返回 False"
+                    continue
+                return True, f"{method_name}({path})"
+            except Exception as err:
+                last_err = str(err)
+        return False, last_err
+
+    def _touch_filesystem_path_for_refresh(self, probes: List[Path]) -> Tuple[bool, str]:
+        last_err = ""
+        for path in probes:
+            try:
+                if path.exists():
+                    if path.is_dir():
+                        first_item = next(path.iterdir(), None)
+                        if first_item is not None:
+                            return True, f"iterdir({path})"
+                        last_err = f"目录暂为空或内容未刷新：{path}"
+                        continue
+                    return True, f"exists({path})"
+            except Exception as err:
+                last_err = str(err)
+        return False, last_err
+
+    def _ensure_scrape_path_refreshed(self, target: Path, reason: str = "", refresh_batch: set = None) -> Tuple[bool, str]:
+        """按需预热/探测 CD2 路径。
+
+        只按具体路径去重，不再用“本批次已刷新过”覆盖所有层级。
+        刷新成功才长时间缓存；刷新失败只短暂缓存，避免 CD2 刚好未就绪时 600 秒内不再尝试。
+        """
+        try:
+            interval = max(float(self._scrape_path_refresh_interval_seconds or 0), 0)
+        except Exception:
+            interval = self.DEFAULT_SCRAPE_PATH_REFRESH_INTERVAL_SECONDS
+        scope = self._scrape_refresh_scope_path(Path(target))
+        scope_text = self._normalise_path_text(str(scope)).rstrip("/")
+        scrape_root = self._normalise_path_text(self._scrape_target_root or self.DEFAULT_SCRAPE_TARGET_ROOT).rstrip("/")
+        if not scope_text:
+            return False, "刷新路径为空"
+        if scrape_root and not self._path_same_or_under(scope_text, scrape_root):
+            return False, f"跳过非刮削目标根路径：{scope_text}"
+
+        key = scope_text.lower()
+        if refresh_batch is not None and key in refresh_batch:
+            return True, "本批次已刷新过该路径"
+
+        cache = getattr(self, "_scrape_path_refresh_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._scrape_path_refresh_cache = cache
+        now_ts = time.time()
+        cache_item = cache.get(key)
+        cache_ok = False
+        last_ts = 0.0
+        if isinstance(cache_item, dict):
+            try:
+                last_ts = float(cache_item.get("ts") or 0)
+            except Exception:
+                last_ts = 0.0
+            cache_ok = bool(cache_item.get("ok"))
+        else:
+            try:
+                last_ts = float(cache_item or 0)
+                cache_ok = True
+            except Exception:
+                last_ts = 0.0
+                cache_ok = False
+        failure_interval = min(max(interval, 0), 30) if interval else 10
+        effective_interval = interval if cache_ok else failure_interval
+        if effective_interval and last_ts and now_ts - last_ts < effective_interval:
+            if cache_ok:
+                if refresh_batch is not None:
+                    refresh_batch.add(key)
+                return True, f"{effective_interval:g} 秒内已刷新过该路径"
+            return False, f"{effective_interval:g} 秒内已探测过该路径但未确认就绪，等待重试"
+
+        probes = self._scrape_refresh_probe_paths(scope)
+        ok = False
+        detail = ""
+        preheat_detail = ""
+        try:
+            chain = self._get_storagechain()
+        except Exception as err:
+            chain = None
+            detail = f"初始化 StorageChain 失败：{err}"
+
+        scope_ready_by_storage = False
+        scope_is_media_file = Path(scope).suffix.lower() in self._media_suffixes()
+        if chain is not None:
+            # 先触碰目标层级和父级，触发 CD2 懒加载；
+            # 但最终是否缓存为成功，必须以目标 scope 自己可见且非空为准。
+            # 对真实媒体文件，只有目标文件本身 get_file_item 成功或文件存在，才算就绪；
+            # 父目录非空只能作为预热信息，不能缓存为成功。
+            for path in probes:
+                try:
+                    fileitem = chain.get_file_item(storage=self._storage, path=path)
+                    if fileitem and not preheat_detail:
+                        preheat_detail = f"get_file_item({path})"
+                    if path == scope and fileitem and scope_is_media_file:
+                        scope_ready_by_storage = True
+                except Exception as err:
+                    detail = str(err)
+            for method_name in ("refresh", "refresh_path", "refresh_item", "list_files", "list_items", "list_file", "list", "get_files", "get_items", "get_file_list"):
+                lower_name = method_name.lower()
+                is_list_method = any(token in lower_name for token in ("list", "files", "items"))
+                for path in probes:
+                    method_ok, method_detail = self._call_storage_path_method(chain, method_name, path)
+                    if method_ok and not preheat_detail:
+                        preheat_detail = method_detail
+                    if path == scope and method_ok and is_list_method and not scope_is_media_file:
+                        scope_ready_by_storage = True
+
+        fs_ok, fs_detail = self._touch_filesystem_path_for_refresh([scope])
+        ok = bool(fs_ok or scope_ready_by_storage)
+        if ok:
+            detail = fs_detail or preheat_detail or detail
+        else:
+            parent_ok, parent_detail = self._touch_filesystem_path_for_refresh(probes[1:]) if len(probes) > 1 else (False, "")
+            detail = fs_detail or preheat_detail or parent_detail or detail
+
+        cache[key] = {"ts": now_ts, "ok": bool(ok)}
+        expire_after = max(interval * 6, 3600) if interval else 3600
+        for item_key, item_value in list(cache.items()):
+            try:
+                item_ts = float(item_value.get("ts") if isinstance(item_value, dict) else item_value or 0)
+                if now_ts - item_ts > expire_after:
+                    cache.pop(item_key, None)
+            except Exception:
+                cache.pop(item_key, None)
+        if ok and refresh_batch is not None:
+            refresh_batch.add(key)
+
+        reason_text = f"（{reason}）" if reason else ""
+        if ok:
+            logger.info(f"监控strm刮削网盘：刮削前已刷新/探测 CD2 路径{reason_text}：{scope_text}，方式：{detail}")
+            return True, detail or "已刷新/探测路径"
+        logger.debug(f"监控strm刮削网盘：刮削前刷新/探测 CD2 路径未确认{reason_text}：{scope_text}，{detail or '无可用刷新方法'}")
+        return False, detail or "刷新/探测路径未确认"
+
+    def _map_strm_file_to_media_target(self, strm_path: Path, refresh_batch: set = None) -> str:
         """把 STRM 文件映射到 CD2 真实媒体文件。
 
         只按同名真实视频匹配，不读取 STRM 内容里的 HTTP 短链，避免短链名与网盘实际文件名不一致。
+        单集真实文件采用文件级探测：即使父目录暂时不可见，也会逐个候选后缀尝试 StorageChain fileitem。
         """
         mapped = Path(self._map_strm_path_to_scrape_path(str(strm_path)))
         if mapped.suffix.lower() != ".strm":
-            return str(mapped) if mapped.exists() and mapped.is_file() else ""
+            if not self._is_safe_episode_scrape_file(mapped):
+                return ""
+            mapped_ready, _ = self._ensure_scrape_path_refreshed(mapped, reason="单集真实媒体查找", refresh_batch=refresh_batch)
+            return str(mapped) if mapped_ready or (mapped.exists() and mapped.is_file()) else ""
 
         parent = mapped.parent
         stem = mapped.stem
         try:
-            if not parent.exists() or not parent.is_dir():
-                return ""
+            # 父目录只做预热，不作为候选文件探测的前置条件；CD2/FUSE 下父目录可能还没本地可见，
+            # 但 StorageChain 已经能按完整文件路径拿到目标 fileitem。
+            self._ensure_scrape_path_refreshed(parent, reason="单集真实媒体父目录预热", refresh_batch=refresh_batch)
 
             for suffix in self._media_suffixes():
                 candidate = parent / f"{stem}{suffix}"
-                if candidate.exists() and candidate.is_file():
+                if not self._is_safe_episode_scrape_file(candidate):
+                    continue
+                candidate_ready, _ = self._ensure_scrape_path_refreshed(candidate, reason="单集真实媒体候选查找", refresh_batch=refresh_batch)
+                if candidate_ready or (candidate.exists() and candidate.is_file()):
                     return str(candidate)
 
-            for item in parent.iterdir():
-                if item.is_file() and item.stem == stem and item.suffix.lower() in self._media_suffixes():
-                    return str(item)
+            if parent.exists() and parent.is_dir():
+                for item in parent.iterdir():
+                    if item.is_file() and item.stem == stem and self._is_safe_episode_scrape_file(item):
+                        return str(item)
         except Exception as err:
             logger.debug(f"监控strm刮削网盘：查找网盘真实媒体失败：{mapped} - {err}")
         return ""
 
-    def _map_episode_strm_to_scrape_target(self, episode_strm: Path) -> str:
+    def _map_episode_strm_to_scrape_target(self, episode_strm: Path, refresh_batch: set = None) -> str:
         # STRM 库是 .strm，MP 实际刮削必须使用 CD2 中的真实媒体文件。
         # 找不到时返回空字符串，由任务处理阶段记录失败并通知，不再退回刮削 Season 目录。
-        return self._map_strm_file_to_media_target(episode_strm)
+        return self._map_strm_file_to_media_target(episode_strm, refresh_batch=refresh_batch)
 
     def _movie_same_name_candidate_paths(self, movie_strm: Path, movie_dir: Path) -> List[str]:
         """按 STRM 同名规则生成 CD2 真实电影文件候选路径。
@@ -2992,6 +3549,7 @@ class LocalMetadataCleaner(_PluginBase):
         if not self._is_safe_movie_scrape_file(target):
             return False, f"电影刮削目标被安全规则拒绝：{target}"
         try:
+            self._ensure_scrape_path_refreshed(target, reason="电影刮削")
             if self._storagechain is None:
                 self._storagechain = StorageChain()
             fileitem = self._storagechain.get_file_item(storage=self._storage, path=target)
@@ -3011,53 +3569,59 @@ class LocalMetadataCleaner(_PluginBase):
             return False, f"电影真实文件候选暂不可用：{target} - {err}"
 
 
-    def _map_movie_strm_to_scrape_target(self, movie_strm: Path, movie_dir: Path) -> str:
-        # 兼容旧调用：电影只返回 STRM 同名 CD2 真实视频文件。
-        # 主流程已改为直接逐个请求 MP fileitem；这里不再扫描目录选最大文件，也不返回 STRM 路径。
-        for candidate in self._movie_same_name_candidate_paths(movie_strm, movie_dir):
-            try:
-                path = Path(candidate)
-                if path.exists() and path.is_file():
-                    return str(path)
-            except Exception:
-                continue
-        return ""
-
-
-    def _trigger_tv_metadata_scrape(self, scope_dir: Path, episodes: List[Path] = None, purpose: str = "剧/季信息", skip_file_targets: set = None) -> Tuple[bool, str, str, bool]:
+    def _trigger_tv_metadata_scrape(self, scope_dir: Path, episodes: List[Path] = None, purpose: str = "剧/季信息", skip_file_targets: set = None, refresh_batch: set = None) -> Tuple[bool, str, str, bool]:
         """触发电视剧剧信息/季信息刮削。
 
         返回：(是否成功, 消息, 实际目标, 是否使用文件兜底)。
         规则：按 MP 原生模式处理，剧信息/季信息只传 CD2 目录，不使用真实单集文件兜底；第四项固定为 False。
         """
         mapped_dir = Path(self._map_strm_path_to_scrape_path(str(scope_dir)))
+        refresh_ok, refresh_msg = self._ensure_scrape_path_refreshed(mapped_dir, reason=purpose, refresh_batch=refresh_batch)
         if mapped_dir.exists() and mapped_dir.is_dir():
-            ok, msg = self._trigger_scrape(mapped_dir)
+            ok, msg = self._trigger_scrape(mapped_dir, refresh_batch=refresh_batch)
             if ok:
                 return True, msg, str(mapped_dir), False
             return False, f"{purpose}目录刮削失败：{msg}", str(mapped_dir), False
-        return False, f"{purpose}目录不存在或不可访问：{mapped_dir}", str(mapped_dir), False
+        refresh_note = f"；刮削前路径刷新：{refresh_msg}" if refresh_msg else ""
+        if refresh_ok:
+            refresh_note = f"；刮削前路径刷新：{refresh_msg}，但目录仍不可访问"
+        return False, f"{purpose}目录不存在或不可访问：{mapped_dir}{refresh_note}", str(mapped_dir), False
 
     def _episode_media_candidate_paths(self, episode_strm: Path) -> List[str]:
         """返回单集 STRM 映射到 CD2 后会尝试查找的同名视频路径。"""
         mapped = Path(self._map_strm_path_to_scrape_path(str(episode_strm)))
         if mapped.suffix.lower() != ".strm":
-            return [str(mapped)]
-        return [str(mapped.with_suffix(suffix)) for suffix in self._media_suffixes()]
+            return [str(mapped)] if self._is_safe_episode_scrape_file(mapped) else []
+        return [str(mapped.with_suffix(suffix)) for suffix in self._media_suffixes() if self._is_safe_episode_scrape_file(mapped.with_suffix(suffix))]
 
-    def _movie_media_candidate_paths(self, movie_strm: Path, movie_dir: Path) -> List[str]:
-        """返回电影补刮削会尝试的 CD2 同名真实视频候选路径，用于失败说明。"""
-        return self._movie_same_name_candidate_paths(movie_strm, movie_dir)
+    def _is_safe_episode_scrape_file(self, target: Path) -> bool:
+        """电视剧单集刮削目标安全保护：只能是 CD2 真实视频文件候选。"""
+        try:
+            text = self._normalise_path_text(str(target))
+            if not text:
+                return False
+            scrape_root = self._normalise_path_text(self._scrape_target_root or self.DEFAULT_SCRAPE_TARGET_ROOT).rstrip("/")
+            strm_root = self._normalise_path_text(self._strm_check_root or self.DEFAULT_STRM_CHECK_ROOT).rstrip("/")
+            if not self._path_same_or_under(text, scrape_root):
+                return False
+            if strm_root and self._path_same_or_under(text, strm_root):
+                return False
+            suffix = Path(text).suffix.lower()
+            if suffix == ".strm":
+                return False
+            if suffix not in self._media_suffixes():
+                return False
+            return True
+        except Exception:
+            return False
 
-
-    # --------------------------- 刮削 ---------------------------
-
-    def _trigger_scrape(self, target: Path) -> Tuple[bool, str]:
+    def _trigger_scrape(self, target: Path, refresh_batch: set = None) -> Tuple[bool, str]:
         if not self._scrape:
             return False, "未启用刮削"
         if StorageChain is None:
             return False, "当前 MP 版本无法导入 StorageChain"
         try:
+            self._ensure_scrape_path_refreshed(target, reason="MP 刮削", refresh_batch=refresh_batch)
             if self._storagechain is None:
                 self._storagechain = StorageChain()
             # 当前 MP 本地存储 get_item 需要 pathlib.Path，传 str 会触发：'str' object has no attribute 'exists'。
@@ -3066,14 +3630,22 @@ class LocalMetadataCleaner(_PluginBase):
             fileitem = self._storagechain.get_file_item(storage=self._storage, path=target)
             if not fileitem:
                 return False, f"无法获取文件项，请确认路径在 MP 容器内可见：{target}"
-            file_list = self._file_list_for_scrape(target)
+            target_is_media_file = target.suffix.lower() in self._media_suffixes()
+            if target_is_media_file:
+                # CD2/FUSE 有时 StorageChain 已能获取 fileitem，但 Path.is_file() 仍短暂返回 False。
+                # 真实媒体文件目标直接固定 file_list，避免发送空列表导致 MP 单集刮削不生效。
+                file_list = [str(target)]
+            else:
+                file_list = self._file_list_for_scrape(target)
+            if target.is_dir() and not file_list:
+                return False, f"目录下未找到真实媒体文件，等待 CD2 刷新：{target}"
             eventmanager.send_event(EventType.MetadataScrape, {
                 "fileitem": fileitem,
                 "file_list": file_list,
                 "meta": None,
                 "mediainfo": None
             })
-            scope = "文件" if target.is_file() else "目录"
+            scope = "文件" if target_is_media_file or target.is_file() else "目录"
             msg = f"已发送 MP 刮削事件，{scope}：{target}，媒体文件 {len(file_list)} 个"
             logger.info(f"监控strm刮削网盘：{msg}")
             return True, msg
@@ -3972,6 +4544,10 @@ class LocalMetadataCleaner(_PluginBase):
         if task_type == "tv_postcheck":
             show_root = Path(str(item.get("show_root") or ""))
             return f"刮削后检查：{show_root.name or str(show_root)}"
+        if task_type == "tv_metadata_retry":
+            scope_dir = Path(str(item.get("scope_dir") or ""))
+            purpose = str(item.get("purpose") or "剧/季信息")
+            return f"CD2就绪重试：{purpose} {scope_dir.name or str(scope_dir)}"
         if task_type == "episode_scrape":
             ep = Path(str(item.get("episode_strm") or ""))
             return f"单集刮削：{ep.stem or key}"
@@ -3988,12 +4564,13 @@ class LocalMetadataCleaner(_PluginBase):
             "3. MP 必须同时映射 STRM 文件夹和 CD2 文件夹，建议 STRM 映射路径与 Emby 一致。例如 Emby 是 /media，MP 也建议映射为 /media。\n"
             "4. STRM 检查根路径填写 Emby/MP 看到的 STRM 根目录，例如 /media；MP 刮削目标根路径填写 MP 看到的 CD2 网盘媒体根目录，例如 /CD2/115/CMS影库/影视。兜底检查周期只用于补跑丢失或到期未执行的队列任务。\n"
             "5. 路径示例：/media/电影/华语电影/片名/xxx.strm 用于检查；需要刮削时映射为 /CD2/115/CMS影库/影视/电影/华语电影/片名。\n"
-            "6. 电影：检查片名目录是否同时存在 backdrop、fanart、poster/folder/cover 类图片和任意 nfo；完整则跳过，不完整则立即刮削一次，不进入后续队列。\n"
-            "7. 电视剧/番剧：定位 STRM 所在剧名根目录。剧名根目录没有任何图片/nfo 时，立即刮削整部剧；刮削事件发送成功后创建 10 分钟检查，缺图集才加入 10 天复查队列。\n"
+            "6. 电影：检查片名目录是否同时存在 backdrop、fanart、poster/folder/cover 类图片和任意 nfo；完整则跳过，不完整则只用 CD2 同名真实视频文件刮削，文件暂不可见时进入短期重试。\n"
+            "7. 电视剧/番剧：定位 STRM 所在剧名根目录。剧名根目录缺少剧级图片/nfo 时刮削整部剧；CD2 剧目录/Season 目录/单集真实视频暂不可见时会先预热路径并短期重试，不会立即判最终失败。\n"
             "8. 剧名根目录已有基础信息时，会先检查当前季信息；具体季号只认可 season02-poster 这类对应季海报，避免通用 season-poster 误判第二季完整。缺季信息会刮削当前季并在 10 分钟后复查季信息。\n"
             "9. 本次入库单集缺图时，先删除该集同名 nfo，等待 30 秒后只刮削该集；单集刮削事件发送成功后，才从成功时间开始计时 10 分钟检查。仍缺图时加入 10 天复查队列；已生成图片的旧复查任务会自动清理。\n"
-            "10. 媒体库过滤会同时识别路径第一层和第二层，例如 /media/电视剧/国产剧/... 可命中‘电视剧’或‘国产剧’；如果媒体库名称和实际路径不一致，可在‘媒体库路径映射’里填写：媒体库名称|类型|路径1,路径2，例如 动漫|tv|/media/电视剧/国漫,/media/电视剧/日番。\n"
-            "11. 待处理任务可在插件详情页单独立即执行、删除或清空，同一部剧的单集刮削任务会合并展示。检查类任务手动提前检查仍缺图时，会保留原到期时间，不会提前进入10天复查。"
+            "10. 刮削前会按配置间隔刷新/探测一次 CD2 目标路径；同一批电视剧任务和同一刷新间隔内不会重复刷新同一路径。\n"
+            "11. 媒体库过滤会同时识别路径第一层和第二层，例如 /media/电视剧/国产剧/... 可命中‘电视剧’或‘国产剧’；如果媒体库名称和实际路径不一致，可在‘媒体库路径映射’里填写：媒体库名称|类型|路径1,路径2，例如 动漫|tv|/media/电视剧/国漫,/media/电视剧/日番。\n"
+            "12. 待处理任务可在插件详情页单独立即执行、删除或清空，同一部剧的单集刮削任务会合并展示。检查类任务手动提前检查仍缺图时，会保留原到期时间，不会提前进入10天复查。"
         )
 
     def __update_config(self):
@@ -4011,6 +4588,7 @@ class LocalMetadataCleaner(_PluginBase):
             "cron": self._cron,
             "initial_check_delay_seconds": self._initial_check_delay_seconds,
             "episode_scrape_delay_seconds": self._episode_scrape_delay_seconds,
+            "scrape_path_refresh_interval_seconds": self._scrape_path_refresh_interval_seconds,
             "tv_recheck_days": self._tv_recheck_days,
             "scrape": self._scrape,
             "queue_delete_items": [],
