@@ -41,7 +41,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "2.2"
+    plugin_version = "2.3"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -121,7 +121,10 @@ class LocalMetadataCleaner(_PluginBase):
         "tv_metadata_retry_failed": "剧季重试失败",
         "episode_scrape_retry_wait": "单集继续等待",
         "episode_scrape_retry_failed": "单集重试失败",
+        "episode_nfo_delete_retry_wait": "单集 nfo 删除等待",
+        "episode_nfo_delete_failed": "单集 nfo 删除失败",
         "episode_scrape_target_missing": "单集刮削文件缺失",
+        "episode_scrape_target_rejected": "单集刮削目标拒绝",
         "tv_recheck_missing_episodes_schedule_scrape": "10天复查缺图",
         "tv_recheck_complete": "10天复查完成",
         "queue_cleared_by_user": "清空队列",
@@ -705,7 +708,7 @@ class LocalMetadataCleaner(_PluginBase):
             "tv_metadata_retry": {"label": "等待剧/季路径重试", "icon": "mdi-folder-refresh-outline", "desc": "下一步会继续预热 CD2 剧名目录或 Season 目录；就绪后触发目录刮削。"},
             "episode_scrape": {"label": "等待刮削任务", "icon": "mdi-play-circle-outline", "desc": "下一步会触发真实媒体文件刮削；成功后再创建10分钟检查。"},
             "tv_postcheck": {"label": "等待10分钟检查", "icon": "mdi-timer-check-outline", "desc": "下一步会确认图片/季信息是否已生成；提前手动检查仍缺图时会保留原到期时间。"},
-            "tv_recheck": {"label": "等待10天复查", "icon": "mdi-calendar-clock", "desc": "下一步会再次确认缺图集，仍缺图才删除同名 nfo 并重新排单集刮削。"},
+            "tv_recheck": {"label": "等待10天复查", "icon": "mdi-calendar-clock", "desc": "下一步会再次确认缺图集，仍缺图才重新排单集刮削；实际刮削前删除 CD2 同名 nfo。"},
             "other": {"label": "其他任务", "icon": "mdi-dots-horizontal-circle-outline", "desc": "未知或兼容旧版本的任务。"},
         }
         order = ["initial", "movie_retry", "tv_metadata_retry", "episode_scrape", "tv_postcheck", "tv_recheck", "other"]
@@ -740,7 +743,7 @@ class LocalMetadataCleaner(_PluginBase):
             if media_type == "movie":
                 return "检查电影目录是否有 poster/fanart/backdrop 和 nfo；缺失时查找真实视频文件并触发 MP 刮削。"
             if media_type == "tv":
-                return "检查本次入库季/集的刮削信息；缺图时删除同名 nfo，并排单集刮削任务。"
+                return "检查本次入库季/集的刮削信息；缺图时排单集刮削任务，实际刮削前删除 CD2 同名 nfo。"
             return "检查 STRM 路径类型和刮削信息，符合条件后再登记后续任务。"
         if task_type == "movie_retry":
             return "继续尝试 CD2 同名真实视频文件的不同后缀；成功后触发电影刮削，失败则继续短期等待或最终记录失败。"
@@ -752,7 +755,7 @@ class LocalMetadataCleaner(_PluginBase):
                 return "检查本次涉及季的 season 海报、Season 目录 poster 和 season.nfo；仍缺失时记录异常但不提前进入10天复查。"
             return "检查本批单集图片是否已生成；到期检查仍缺图时才加入10天复查，手动提前检查仍缺图会继续等待原时间。"
         if task_type == "tv_recheck":
-            return "重新确认缺图集；到期或手动立即复查时，仍缺图会删除同名 nfo，并重新排单集刮削任务。"
+            return "重新确认缺图集；到期或手动立即复查时，仍缺图会重新排单集刮削任务，实际刮削前删除 CD2 同名 nfo。"
         if task_type == "tv_metadata_retry":
             return "重新预热/探测 CD2 剧名目录或 Season 目录；就绪后触发对应目录刮削。"
         return "按兼容逻辑处理该任务。"
@@ -1753,12 +1756,10 @@ class LocalMetadataCleaner(_PluginBase):
             return str(Path(str(value or ""))) if value else ""
 
         # 先检查本次快照内的每一集是否已有图片。
-        # 注意：这里不立即删除单集 nfo。若剧/季目录刮削会覆盖该集，先等待目录刮削后的10分钟检查；
-        # 只有真正进入单集补刮削时，才删除该集对应 nfo，避免目录刮削和单集刮削造成重复删除/重复刮削。
+        # 注意：这里不立即删除 CD2 单集 nfo。若剧/季目录刮削会覆盖该集，先等待目录刮削后的10分钟检查；
+        # 只有真正进入单集补刮削时，才删除该集 CD2 对应 nfo，避免目录刮削和单集刮削造成重复删除/重复刮削。
         missing_eps: List[Path] = []
         existing_count = 0
-        deleted_total = 0
-        deleted_map: Dict[str, int] = {}
         for episode_strm in episode_paths:
             episode_status = self._episode_image_status(episode_strm)
             if episode_status.get("has_image"):
@@ -2006,19 +2007,14 @@ class LocalMetadataCleaner(_PluginBase):
             if key and key in sent_targets:
                 shared_trigger_eps.append(episode_strm)
                 continue
-            deleted = 0
             if not target:
                 target_missing_eps.append(episode_strm)
-            else:
-                deleted = self._delete_episode_nfo(episode_strm)
-                deleted_map[str(episode_strm)] = int(deleted or 0)
-                deleted_total += int(deleted or 0)
             self._ensure_episode_scrape_task(
                 state,
                 episode_strm,
                 show_root,
                 reason="initial_missing_image",
-                deleted_nfo=deleted,
+                deleted_nfo=0,
                 postcheck_batch_id=postcheck_batch_id,
             )
             scheduled_eps.append(episode_strm)
@@ -2051,11 +2047,11 @@ class LocalMetadataCleaner(_PluginBase):
             result = {
                 "time": self._now_iso(), "action": "tv_episode_missing_image_schedule_scrape", "scope": str(show_root),
                 "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
-                "scrape_msg": f"本次按{self._tv_scan_scope_label(scan_scope_type)}检查 {len(episode_paths)} 集，其中 {len(missing_eps)} 集缺少对应图片；已为需要立即单集补刮削的集删除同名 nfo {deleted_total} 个。目录刮削覆盖的集先等待10分钟检查，仍缺图才触发单集刮削；单集刮削成功后再计时10分钟检查，仍缺图才加入10天复查。{extra}",
+                "scrape_msg": f"本次按{self._tv_scan_scope_label(scan_scope_type)}检查 {len(episode_paths)} 集，其中 {len(missing_eps)} 集缺少对应图片；已为需要立即单集补刮削的集创建任务，实际刮削前会删除 CD2 同名 nfo。目录刮削覆盖的集先等待10分钟检查，仍缺图才触发单集刮削；单集刮削成功后再计时10分钟检查，仍缺图才加入10天复查。{extra}",
                 "note": names,
                 "missing_count": len(missing_eps),
                 "existing_count": existing_count,
-                "deleted_nfo": deleted_total,
+                "deleted_nfo": 0,
                 **self._episode_history_payload(show_root, episode_paths, prefix="checked"),
                 **self._episode_history_payload(show_root, missing_eps, prefix="missing"),
             }
@@ -2137,10 +2133,54 @@ class LocalMetadataCleaner(_PluginBase):
                 self._send_notify(result)
             return {"remove": True, **result}
 
-        ok, msg = self._trigger_scrape(target_path)
+        deleted_now, delete_failed, delete_msg = self._delete_episode_nfo(
+            episode_strm,
+            media_target=target_path,
+            refresh_batch=refresh_batch,
+        )
+        if delete_failed:
+            delays = self._tv_cd2_retry_delays()
+            has_next, due_ts, retry_count = self._advance_retry_task(task, delays, reason=delete_msg)
+            result = {
+                "time": self._now_iso(),
+                "action": "episode_nfo_delete_retry_wait" if has_next else "episode_nfo_delete_failed",
+                "scope": str(episode_strm),
+                "folder": str(target_path),
+                "scrape": None if has_next else False,
+                "scrape_msg": (
+                    f"刮削前删除 CD2 同名 nfo 失败，已安排短期重试：{self._ts_to_str(due_ts)}。原因：{delete_msg}"
+                    if has_next else
+                    f"单集刮削失败：刮削前删除 CD2 同名 nfo 多次失败，未触发刮削。最后原因：{delete_msg}；已重试 {retry_count} 次。"
+                ),
+                "deleted_nfo": int(task.get("deleted_nfo") or 0),
+                "note": str(task.get("reason") or "")
+            }
+            if has_next:
+                task["status"] = "waiting_episode_scrape"
+                task["scrape_target"] = str(target_path)
+                task["last_msg"] = result["scrape_msg"]
+                self._append_history(state, result)
+                return {"remove": False, **result}
+            self._append_history(state, result)
+            if self._notify:
+                self._send_notify(result)
+            return {"remove": True, **result}
+
+        if deleted_now:
+            task["deleted_nfo"] = int(task.get("deleted_nfo") or 0) + int(deleted_now or 0)
+        total_deleted_nfo = int(task.get("deleted_nfo") or 0)
+
+        ok, raw_msg = self._trigger_scrape(target_path)
+        if deleted_now:
+            delete_note = f"刮削前已删除 CD2 同名 nfo {deleted_now} 个"
+        elif total_deleted_nfo:
+            delete_note = f"此前已删除 CD2 同名 nfo {total_deleted_nfo} 个"
+        else:
+            delete_note = ""
+        msg = f"{raw_msg}；{delete_note}" if delete_note else raw_msg
         result = {
             "time": self._now_iso(), "action": "episode_delayed_scrape", "scope": str(episode_strm), "folder": str(target_path),
-            "scrape": ok, "scrape_msg": msg, "deleted_nfo": int(task.get("deleted_nfo") or 0),
+            "scrape": ok, "scrape_msg": msg, "deleted_nfo": total_deleted_nfo,
             "note": str(task.get("reason") or "")
         }
         if ok and show_root and str(show_root):
@@ -2163,11 +2203,13 @@ class LocalMetadataCleaner(_PluginBase):
                 task["last_msg"] = f"单集真实媒体 fileitem 暂不可用，等待下次重试：{self._ts_to_str(due_ts)}"
                 result["action"] = "episode_scrape_retry_wait"
                 result["scrape"] = None
-                result["scrape_msg"] = f"单集真实媒体 fileitem 暂不可用，已安排短期重试：{self._ts_to_str(due_ts)}。原始原因：{msg}"
+                delete_prefix = f"{delete_note}；" if delete_note else ""
+                result["scrape_msg"] = f"单集真实媒体 fileitem 暂不可用，已安排短期重试：{self._ts_to_str(due_ts)}。{delete_prefix}原始原因：{raw_msg}"
                 self._append_history(state, result)
                 return {"remove": False, **result}
             result["action"] = "episode_scrape_retry_failed"
-            result["scrape_msg"] = f"单集刮削失败：多次等待后仍无法触发 MP 刮削。最后原因：{msg}；已重试 {retry_count} 次。"
+            delete_prefix = f"{delete_note}；" if delete_note else ""
+            result["scrape_msg"] = f"单集刮削失败：多次等待后仍无法触发 MP 刮削。{delete_prefix}最后原因：{raw_msg}；已重试 {retry_count} 次。"
         self._append_history(state, result)
         if self._notify and not ok:
             self._send_notify(result)
@@ -2289,24 +2331,21 @@ class LocalMetadataCleaner(_PluginBase):
                 self._append_history(state, result)
                 return {"remove": False, **result}
             if str(task.get("on_missing") or "") == "episode_scrape":
-                total_deleted = 0
                 next_batch_id = self._make_task_batch_id("postdir")
                 for ep in missing:
-                    deleted = self._delete_episode_nfo(ep)
-                    total_deleted += int(deleted or 0)
                     self._ensure_episode_scrape_task(
                         state,
                         ep,
                         show_root,
                         reason="metadata_directory_scrape_still_missing_image",
-                        deleted_nfo=deleted,
+                        deleted_nfo=0,
                         postcheck_batch_id=next_batch_id,
                     )
                 result = {
                     "time": self._now_iso(), "action": "tv_postcheck_missing_schedule_episode_scrape", "scope": str(show_root),
                     "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
-                    "scrape_msg": f"目录刮削后检查了 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片，已删除同名 nfo {total_deleted} 个，并创建单集刮削任务；不会直接加入 10 天复查。" + (f" 同时清理旧复查中已完成 {cleaned_count} 集。" if cleaned_count else ""),
-                    "missing_count": len(missing), "deleted_nfo": total_deleted, "note": names,
+                    "scrape_msg": f"目录刮削后检查了 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片，已创建单集刮削任务，实际刮削前会删除 CD2 同名 nfo；不会直接加入 10 天复查。" + (f" 同时清理旧复查中已完成 {cleaned_count} 集。" if cleaned_count else ""),
+                    "missing_count": len(missing), "deleted_nfo": 0, "note": names,
                     **self._episode_history_payload(show_root, checked_episodes, prefix="checked"),
                     **self._episode_history_payload(show_root, missing, prefix="missing"),
                 }
@@ -2363,23 +2402,20 @@ class LocalMetadataCleaner(_PluginBase):
             result = {"time": self._now_iso(), "action": "tv_recheck_complete", "scope": str(show_root), "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None, "scrape_msg": f"10天复查完成，检查 {checked_count} 集，均已有对应图片", **self._episode_history_payload(show_root, checked_payload, prefix="checked")}
             self._append_history(state, result)
             return {"remove": True, **result}
-        total_deleted = 0
         postcheck_batch_id = self._make_task_batch_id("recheck")
         for episode in missing:
-            deleted = self._delete_episode_nfo(episode)
-            total_deleted += deleted
             self._ensure_episode_scrape_task(
                 state,
                 episode,
                 show_root,
                 reason="tv_10day_recheck_missing_image",
-                deleted_nfo=deleted,
+                deleted_nfo=0,
                 postcheck_batch_id=postcheck_batch_id,
             )
         result = {
             "time": self._now_iso(), "action": "tv_recheck_missing_episodes_schedule_scrape", "scope": str(show_root), "folder": self._map_strm_path_to_scrape_path(str(show_root)),
-            "scrape": None, "scrape_msg": f"10天复查检查 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片，已删除同名 nfo {total_deleted} 个，{self._episode_scrape_delay_seconds:g} 秒后逐集刮削。",
-            "missing_count": len(missing), "deleted_nfo": total_deleted,
+            "scrape": None, "scrape_msg": f"10天复查检查 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片，已创建单集刮削任务，实际刮削前会删除 CD2 同名 nfo，{self._episode_scrape_delay_seconds:g} 秒后逐集刮削。",
+            "missing_count": len(missing), "deleted_nfo": 0,
             "note": "、".join([self._episode_label(ep, show_root) for ep in missing[:8]]),
             **self._episode_history_payload(show_root, missing, prefix="missing"),
         }
@@ -3067,17 +3103,48 @@ class LocalMetadataCleaner(_PluginBase):
             result.append(parent / name)
         return result
 
-    def _delete_episode_nfo(self, episode_strm: Path) -> int:
+    def _delete_episode_nfo(self, episode_strm: Path, media_target: Path = None, refresh_batch: set = None) -> Tuple[int, bool, str]:
         deleted = 0
-        for nfo in [episode_strm.with_suffix(".nfo")]:
-            try:
-                if nfo.exists() and nfo.is_file():
-                    nfo.unlink()
-                    deleted += 1
-                    logger.info(f"监控strm刮削网盘：已删除单集 nfo：{nfo}")
-            except Exception as err:
-                logger.warning(f"监控strm刮削网盘：删除单集 nfo 失败：{nfo} - {err}")
-        return deleted
+        media_path = Path(media_target) if media_target and self._is_safe_episode_scrape_file(Path(media_target)) else None
+        mapped = media_path or Path(self._map_strm_path_to_scrape_path(str(episode_strm)))
+        nfo = mapped.with_suffix(".nfo")
+        if not self._is_safe_episode_nfo_delete_file(nfo):
+            msg = f"跳过删除单集 nfo，目标不在 CD2 刮削根路径或仍位于 STRM 路径：{nfo}"
+            logger.warning(f"监控strm刮削网盘：{msg}")
+            return deleted, True, msg
+        try:
+            refresh_ok, refresh_msg = self._ensure_scrape_path_refreshed(nfo.parent, reason="删除 CD2 单集 nfo 前刷新父目录", refresh_batch=refresh_batch, force=True)
+            if nfo.exists() and nfo.is_file():
+                nfo.unlink()
+                deleted += 1
+                msg = f"已删除 CD2 单集 nfo：{nfo}"
+                logger.info(f"监控strm刮削网盘：{msg}")
+                return deleted, False, msg
+            if not refresh_ok:
+                msg = f"删除 CD2 单集 nfo 前无法确认父目录已刷新，暂不触发刮削：{nfo.parent}；{refresh_msg}"
+                logger.warning(f"监控strm刮削网盘：{msg}")
+                return deleted, True, msg
+            return deleted, False, f"未找到 CD2 单集 nfo：{nfo}"
+        except Exception as err:
+            msg = f"删除 CD2 单集 nfo 失败：{nfo} - {err}"
+            logger.warning(f"监控strm刮削网盘：{msg}")
+            return deleted, True, msg
+
+    def _is_safe_episode_nfo_delete_file(self, target: Path) -> bool:
+        """单集 nfo 删除安全保护：只能删除 CD2 刮削根路径下的 .nfo。"""
+        try:
+            text = self._normalise_path_text(str(target))
+            if not text or Path(text).suffix.lower() != ".nfo":
+                return False
+            scrape_root = self._normalise_path_text(self._scrape_target_root or self.DEFAULT_SCRAPE_TARGET_ROOT).rstrip("/")
+            strm_root = self._normalise_path_text(self._strm_check_root or self.DEFAULT_STRM_CHECK_ROOT).rstrip("/")
+            if not self._path_same_or_under(text, scrape_root):
+                return False
+            if strm_root and self._path_same_or_under(text, strm_root):
+                return False
+            return True
+        except Exception:
+            return False
 
     def _find_missing_episode_images(self, show_root: Path) -> List[Path]:
         missing: List[Path] = []
@@ -3300,7 +3367,7 @@ class LocalMetadataCleaner(_PluginBase):
                 last_err = str(err)
         return False, last_err
 
-    def _ensure_scrape_path_refreshed(self, target: Path, reason: str = "", refresh_batch: set = None) -> Tuple[bool, str]:
+    def _ensure_scrape_path_refreshed(self, target: Path, reason: str = "", refresh_batch: set = None, force: bool = False) -> Tuple[bool, str]:
         """按需预热/探测 CD2 路径。
 
         只按具体路径去重，不再用“本批次已刷新过”覆盖所有层级。
@@ -3319,7 +3386,7 @@ class LocalMetadataCleaner(_PluginBase):
             return False, f"跳过非刮削目标根路径：{scope_text}"
 
         key = scope_text.lower()
-        if refresh_batch is not None and key in refresh_batch:
+        if not force and refresh_batch is not None and key in refresh_batch:
             return True, "本批次已刷新过该路径"
 
         cache = getattr(self, "_scrape_path_refresh_cache", None)
@@ -3345,7 +3412,7 @@ class LocalMetadataCleaner(_PluginBase):
                 cache_ok = False
         failure_interval = min(max(interval, 0), 30) if interval else 10
         effective_interval = interval if cache_ok else failure_interval
-        if effective_interval and last_ts and now_ts - last_ts < effective_interval:
+        if not force and effective_interval and last_ts and now_ts - last_ts < effective_interval:
             if cache_ok:
                 if refresh_batch is not None:
                     refresh_batch.add(key)
@@ -3576,6 +3643,8 @@ class LocalMetadataCleaner(_PluginBase):
         规则：按 MP 原生模式处理，剧信息/季信息只传 CD2 目录，不使用真实单集文件兜底；第四项固定为 False。
         """
         mapped_dir = Path(self._map_strm_path_to_scrape_path(str(scope_dir)))
+        if not self._is_safe_tv_scrape_dir(mapped_dir):
+            return False, f"{purpose}目录刮削目标被安全规则拒绝：{mapped_dir}", str(mapped_dir), False
         refresh_ok, refresh_msg = self._ensure_scrape_path_refreshed(mapped_dir, reason=purpose, refresh_batch=refresh_batch)
         if mapped_dir.exists() and mapped_dir.is_dir():
             ok, msg = self._trigger_scrape(mapped_dir, refresh_batch=refresh_batch)
@@ -3610,6 +3679,25 @@ class LocalMetadataCleaner(_PluginBase):
             if suffix == ".strm":
                 return False
             if suffix not in self._media_suffixes():
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _is_safe_tv_scrape_dir(self, target: Path) -> bool:
+        """电视剧剧/季刮削目标安全保护：只能是 CD2 刮削根路径下的目录目标。"""
+        try:
+            text = self._normalise_path_text(str(target))
+            if not text:
+                return False
+            scrape_root = self._normalise_path_text(self._scrape_target_root or self.DEFAULT_SCRAPE_TARGET_ROOT).rstrip("/")
+            strm_root = self._normalise_path_text(self._strm_check_root or self.DEFAULT_STRM_CHECK_ROOT).rstrip("/")
+            if not self._path_same_or_under(text, scrape_root):
+                return False
+            if strm_root and self._path_same_or_under(text, strm_root):
+                return False
+            suffix = Path(text).suffix.lower()
+            if suffix == ".strm" or suffix in self._media_suffixes():
                 return False
             return True
         except Exception:
@@ -4567,7 +4655,7 @@ class LocalMetadataCleaner(_PluginBase):
             "6. 电影：检查片名目录是否同时存在 backdrop、fanart、poster/folder/cover 类图片和任意 nfo；完整则跳过，不完整则只用 CD2 同名真实视频文件刮削，文件暂不可见时进入短期重试。\n"
             "7. 电视剧/番剧：定位 STRM 所在剧名根目录。剧名根目录缺少剧级图片/nfo 时刮削整部剧；CD2 剧目录/Season 目录/单集真实视频暂不可见时会先预热路径并短期重试，不会立即判最终失败。\n"
             "8. 剧名根目录已有基础信息时，会先检查当前季信息；具体季号只认可 season02-poster 这类对应季海报，避免通用 season-poster 误判第二季完整。缺季信息会刮削当前季并在 10 分钟后复查季信息。\n"
-            "9. 本次入库单集缺图时，先删除该集同名 nfo，等待 30 秒后只刮削该集；单集刮削事件发送成功后，才从成功时间开始计时 10 分钟检查。仍缺图时加入 10 天复查队列；已生成图片的旧复查任务会自动清理。\n"
+            "9. 本次入库单集缺图时，先创建单集刮削任务；真正触发单集刮削前会删除该集 CD2 同名 nfo，然后只刮削该集。单集刮削事件发送成功后，才从成功时间开始计时 10 分钟检查。仍缺图时加入 10 天复查队列；已生成图片的旧复查任务会自动清理。\n"
             "10. 刮削前会按配置间隔刷新/探测一次 CD2 目标路径；同一批电视剧任务和同一刷新间隔内不会重复刷新同一路径。\n"
             "11. 媒体库过滤会同时识别路径第一层和第二层，例如 /media/电视剧/国产剧/... 可命中‘电视剧’或‘国产剧’；如果媒体库名称和实际路径不一致，可在‘媒体库路径映射’里填写：媒体库名称|类型|路径1,路径2，例如 动漫|tv|/media/电视剧/国漫,/media/电视剧/日番。\n"
             "12. 待处理任务可在插件详情页单独立即执行、删除或清空，同一部剧的单集刮削任务会合并展示。检查类任务手动提前检查仍缺图时，会保留原到期时间，不会提前进入10天复查。"
