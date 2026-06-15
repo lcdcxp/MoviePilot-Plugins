@@ -41,7 +41,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "2.3"
+    plugin_version = "2.4"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -3114,12 +3114,17 @@ class LocalMetadataCleaner(_PluginBase):
             return deleted, True, msg
         try:
             refresh_ok, refresh_msg = self._ensure_scrape_path_refreshed(nfo.parent, reason="删除 CD2 单集 nfo 前刷新父目录", refresh_batch=refresh_batch, force=True)
-            if nfo.exists() and nfo.is_file():
+            nfo_exists = nfo.exists()
+            if nfo_exists and nfo.is_file():
                 nfo.unlink()
                 deleted += 1
                 msg = f"已删除 CD2 单集 nfo：{nfo}"
                 logger.info(f"监控strm刮削网盘：{msg}")
                 return deleted, False, msg
+            if nfo_exists:
+                msg = f"CD2 单集 nfo 路径存在但暂未确认为文件，暂不触发刮削：{nfo}"
+                logger.warning(f"监控strm刮削网盘：{msg}")
+                return deleted, True, msg
             if not refresh_ok:
                 msg = f"删除 CD2 单集 nfo 前无法确认父目录已刷新，暂不触发刮削：{nfo.parent}；{refresh_msg}"
                 logger.warning(f"监控strm刮削网盘：{msg}")
@@ -4378,7 +4383,7 @@ class LocalMetadataCleaner(_PluginBase):
         if not isinstance(markers, dict):
             return
         candidates = []
-        for key in ("show_root", "check_dir", "raw_path", "strm_path", "episode_strm"):
+        for key in ("show_root", "check_dir", "raw_path", "strm_path", "episode_strm", "scope_dir"):
             value = str(task.get(key) or "").strip()
             if value:
                 candidates.append(value)
@@ -4389,7 +4394,14 @@ class LocalMetadataCleaner(_PluginBase):
                         candidates.append(str(path_value.parent))
                 except Exception:
                     pass
+        for value in self._to_list(task.get("season_dirs") or []):
+            if value:
+                candidates.append(value)
+        seen = set()
         for value in candidates:
+            if value in seen:
+                continue
+            seen.add(value)
             markers.pop(f"tv_root_whole_scrape::{value}", None)
             markers.pop(f"tv_season_scrape::{value}", None)
 
