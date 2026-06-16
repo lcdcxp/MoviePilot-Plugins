@@ -30,8 +30,10 @@ from app.log import logger
 from app.plugins import _PluginBase
 
 try:
+    from app import schemas
     from app.schemas import Notification, NotificationType
 except Exception:  # 兼容极少数旧版本或测试环境
+    schemas = None
     Notification = None
     NotificationType = None
 
@@ -42,7 +44,7 @@ class JuyingCheckin(_PluginBase):
     plugin_name = "聚影签到"
     plugin_desc = "用于聚影自动签到，支持账号密码、多账号、定时执行、代理、失败重试和签到历史。感谢大胖提供的支持。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/signin.png"
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     plugin_author = "jidian"
     author_url = "https://share.huamucang.top"
     plugin_config_prefix = "juyingcheckin_"
@@ -158,7 +160,14 @@ class JuyingCheckin(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        return [
+            {
+                "path": "/history_clear",
+                "endpoint": self.api_clear_history,
+                "methods": ["GET"],
+                "summary": "清空签到历史记录",
+            }
+        ]
 
     def get_service(self) -> List[Dict[str, Any]]:
         """注册 MoviePilot 公共定时服务。"""
@@ -242,6 +251,28 @@ class JuyingCheckin(_PluginBase):
                 self._scheduler = None
         except Exception as err:
             logger.error(f"聚影签到：停止服务失败：{self.__sanitize_log_text(err)}")
+
+    def api_clear_history(self, apikey: str = ""):
+        """详情页清空签到历史记录。"""
+        if not self.__check_api_key(apikey):
+            return self.__api_response(False, "API密钥错误")
+        history = self.get_data("history") or []
+        count = len(history) if isinstance(history, list) else 0
+        self.save_data("history", [])
+        self.save_data("latest_result", {})
+        logger.info(f"聚影签到：详情页清空历史记录，共删除 {count} 条")
+        return self.__api_response(True, f"已清空 {count} 条历史记录")
+
+    @staticmethod
+    def __check_api_key(apikey: str) -> bool:
+        token = str(getattr(settings, "API_TOKEN", "") or "")
+        return bool(token) and str(apikey or "") == token
+
+    @staticmethod
+    def __api_response(success: bool, message: str):
+        if schemas is not None and hasattr(schemas, "Response"):
+            return schemas.Response(success=success, message=message)
+        return {"success": success, "message": message}
 
     def _scheduled_checkin(self):
         """定时任务入口；按配置执行随机延迟。"""
@@ -398,10 +429,15 @@ class JuyingCheckin(_PluginBase):
         user_info = self.__pick_user_info(login_data)
 
         if not self.__is_login_success(login_data):
+            message = self.__format_failure_message(
+                prefix="登录失败",
+                message=self.__pick_message(login_data),
+                used_proxy=bool(login_used_proxy),
+            )
             return {
                 "success": False,
                 "already": False,
-                "message": f"登录失败：{self.__pick_message(login_data)}",
+                "message": message,
                 "points": 0,
                 "days": 0,
                 "raw": login_data,
@@ -449,11 +485,14 @@ class JuyingCheckin(_PluginBase):
             ["my_total_days", "total_days"],
             default=user_info.get("checkin_days") if isinstance(user_info, dict) else 0,
         )
+        result_message = message or ("签到成功" if success else "今日已签到" if already else "签到失败")
+        if not success and not already:
+            result_message = self.__format_failure_message("签到失败", result_message, used_proxy)
 
         return {
             "success": bool(success),
             "already": bool(already),
-            "message": message or ("签到成功" if success else "今日已签到" if already else "签到失败"),
+            "message": result_message,
             "points": points,
             "days": days,
             "raw": checkin_data,
@@ -847,7 +886,10 @@ class JuyingCheckin(_PluginBase):
         if http_status in [408, 429, 500, 502, 503, 504]:
             return True
         message = str(data.get("message") or data.get("msg") or data.get("error") or "")
-        return any(key in message for key in ["超时", "timeout", "temporarily", "临时", "服务不可用", "网关", "重试"])
+        return JuyingCheckin.__is_dns_error_text(message) or any(
+            key in message
+            for key in ["超时", "timeout", "timed out", "temporarily", "临时", "服务不可用", "网关", "重试"]
+        )
 
     @staticmethod
     def __is_retryable_result(result: Dict[str, Any]) -> bool:
@@ -861,7 +903,44 @@ class JuyingCheckin(_PluginBase):
         if JuyingCheckin.__is_retryable_payload(raw):
             return True
         message = str(result.get("message") or "")
-        return any(key in message for key in ["网络异常", "请求超时", "连接被重置", "DNS", "代理请求失败"])
+        return JuyingCheckin.__is_dns_error_text(message) or any(
+            key in message for key in ["网络异常", "请求超时", "连接被重置", "DNS", "代理请求失败"]
+        )
+
+    @staticmethod
+    def __is_dns_error_text(message: str) -> bool:
+        text = str(message or "").lower()
+        return any(
+            key in text
+            for key in [
+                "dns",
+                "name resolution",
+                "failed to resolve",
+                "failed to query",
+                "udp server",
+                "receive reply",
+                "temporary failure in name resolution",
+                "解析失败",
+            ]
+        )
+
+    @staticmethod
+    def __format_failure_message(prefix: str, message: str, used_proxy: bool = False) -> str:
+        message = JuyingCheckin.__sanitize_log_text(message or "未知错误").strip()
+        if message.startswith(f"{prefix}："):
+            base = message
+        else:
+            base = f"{prefix}：{message}"
+        if JuyingCheckin.__is_dns_error_text(message):
+            network = "代理/DNS异常" if used_proxy else "DNS异常"
+            hint = (
+                "当前通过 MP 代理请求，目标站点或代理侧 DNS 查询超时；"
+                "请检查 PROXY_HOST 所在容器/宿主机 DNS，必要时先关闭“使用代理”测试直连。"
+                if used_proxy
+                else "请检查 MoviePilot 容器 DNS，或开启“使用代理”后重试。"
+            )
+            return f"{network}：{hint}原始信息：{base}"
+        return base
 
     @staticmethod
     def __build_notify_title(total: int, success: int, already: int, fail: int) -> str:
@@ -949,7 +1028,7 @@ class JuyingCheckin(_PluginBase):
             return "网络异常：连接被重置。建议开启“使用代理”，并确认 MP 的 PROXY_HOST 可用。"
         if "timed out" in text or "Read timed out" in text or "ConnectTimeout" in text:
             return "网络异常：请求超时。建议开启“使用代理”，或适当调大读取超时、重试次数和重试间隔。"
-        if "NameResolutionError" in text or "Failed to resolve" in text or "Temporary failure in name resolution" in text:
+        if JuyingCheckin.__is_dns_error_text(text) or "NameResolutionError" in text or "Failed to resolve" in text or "Temporary failure in name resolution" in text:
             return "网络异常：DNS 解析失败。建议检查容器 DNS，或开启 MP 代理后重试。"
         if "MP代理请求失败" in text:
             return f"网络异常：MP 代理请求失败。详情：{text}"
@@ -1343,7 +1422,6 @@ class JuyingCheckin(_PluginBase):
                                         self.__col_select_notify_type(),
                                         self.__col_text("history_count", "历史保留条数", "30", 4, field_type="number", hint="默认保留最近 30 条。", icon="mdi-history"),
                                         self.__col_switch("check_proxy", "保存后检测代理", 2),
-                                        self.__col_switch("clear_history", "保存后清空历史", 2),
                                     ],
                                 },
                             ],
@@ -1571,6 +1649,7 @@ class JuyingCheckin(_PluginBase):
             "props": {"variant": "flat", "class": "mb-4 elevation-2", "color": "surface", "style": "border-radius: 16px;"},
             "content": [
                 self.__card_title("mdi-table-clock", "最近签到历史", "#9C27B0"),
+                self.__page_history_actions(),
                 {
                     "component": "VCardText",
                     "props": {"class": "pa-6"},
@@ -1609,6 +1688,32 @@ class JuyingCheckin(_PluginBase):
                         },
                     ],
                 },
+            ],
+        }
+
+    @staticmethod
+    def __page_history_actions() -> Dict[str, Any]:
+        return {
+            "component": "div",
+            "props": {"class": "d-flex justify-end px-6 pt-2"},
+            "content": [
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "variant": "tonal",
+                        "color": "warning",
+                        "size": "small",
+                        "prepend-icon": "mdi-broom",
+                    },
+                    "text": "清空历史记录",
+                    "events": {
+                        "click": {
+                            "api": "plugin/JuyingCheckin/history_clear",
+                            "method": "get",
+                            "params": {"apikey": getattr(settings, "API_TOKEN", "")},
+                        }
+                    },
+                }
             ],
         }
 

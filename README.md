@@ -7,7 +7,7 @@
 | 插件ID | 插件名称 | 当前版本 | 目录 |
 | --- | --- | --- | --- |
 | CD2Notify | CloudDrive2通知 | v1.2 | plugins.v2/cd2notify |
-| JuyingCheckin | 聚影签到 | v1.2 | plugins.v2/juyingcheckin |
+| JuyingCheckin | 聚影签到 | v1.3 | plugins.v2/juyingcheckin |
 | LocalMetadataCleaner | 监控strm刮削网盘 | v2.4.1 | plugins.v2/localmetadatacleaner |
 
 ## 更新说明
