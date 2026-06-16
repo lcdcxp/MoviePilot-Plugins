@@ -1,4 +1,5 @@
 from datetime import datetime
+from hmac import compare_digest
 import posixpath
 from threading import Lock, Timer
 from typing import Any, Dict, List, Optional, Tuple
@@ -56,7 +57,7 @@ class CD2Notify(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/webhook.png"
     # 插件版本
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     # 插件作者
     plugin_author = "jidian"
     # 作者主页
@@ -90,6 +91,12 @@ class CD2Notify(_PluginBase):
     _pending_timer: Optional[Timer] = None
     _pending_lock: Optional[Lock] = None
 
+    _max_event_items: int = 1000
+    _max_field_chars: int = 2048
+    _max_history_detail_chars: int = 20000
+    _max_aggregate_wait: int = 3600
+    _max_history_limit: int = 500
+
     def init_plugin(self, config: dict = None):
         self._enabled = True
         self._notify = True
@@ -108,28 +115,27 @@ class CD2Notify(_PluginBase):
         self._notify_rename = True
         self._notify_other = True
 
-        # 初始化聚合通知缓存。开启“等待任务结束后通知”时，会先缓存多次 CD2 回调，
-        # 等待一段时间没有新回调后再统一发送一条汇总通知。
+        # 初始化聚合通知缓存。开启“启用汇总通知”时，会先缓存多次 CD2 回调，
+        # 等待一段时间没有新回调后再统一发送一条汇总通知。插件配置保存时
+        # init_plugin 可能被再次调用，因此这里保留已有待发送队列，避免静默丢事件。
         if self._pending_lock is None:
             self._pending_lock = Lock()
-        try:
-            if self._pending_timer:
-                self._pending_timer.cancel()
-        except Exception:
-            pass
-        self._pending_file_items = []
-        self._pending_file_meta = {}
-        self._pending_timer = None
+        if "_pending_file_items" not in self.__dict__:
+            self._pending_file_items = []
+        if "_pending_file_meta" not in self.__dict__:
+            self._pending_file_meta = {}
+        if "_pending_timer" not in self.__dict__:
+            self._pending_timer = None
 
         if config:
             self._enabled = self._to_bool(config.get("enabled", True))
             self._notify = self._to_bool(config.get("notify", True))
             self._msgtype = config.get("msgtype") or "Manual"
-            self._detail_limit = self._to_int(config.get("detail_limit", 10), 10)
+            self._detail_limit = self._clamp_int(config.get("detail_limit", 10), 10, 0, self._max_event_items)
             self._show_file_name = self._to_bool(config.get("show_file_name", True))
-            self._aggregate_notify = self._to_bool(config.get("aggregate_notify", False))
-            self._aggregate_wait = self._to_int(config.get("aggregate_wait", 20), 20)
-            self._history_limit = self._to_int(config.get("history_limit", 50), 50)
+            self._aggregate_notify = self._to_bool(config.get("aggregate_notify", True))
+            self._aggregate_wait = self._clamp_int(config.get("aggregate_wait", 20), 20, 1, self._max_aggregate_wait)
+            self._history_limit = self._clamp_int(config.get("history_limit", 50), 50, 0, self._max_history_limit)
             self._clear_history = self._to_bool(config.get("clear_history", False))
             self._test_notify = self._to_bool(config.get("test_notify", False))
             self._reset_config = self._to_bool(config.get("reset_config", False))
@@ -138,6 +144,12 @@ class CD2Notify(_PluginBase):
             self._notify_move = self._to_bool(config.get("notify_move", True))
             self._notify_rename = self._to_bool(config.get("notify_rename", True))
             self._notify_other = self._to_bool(config.get("notify_other", True))
+
+        if self._pending_file_items and not self._enabled:
+            self._discard_pending_file_notify("插件已关闭，丢弃待汇总文件事件")
+        elif self._pending_file_items and not self._aggregate_notify:
+            self._cancel_pending_timer()
+            self._flush_file_notify()
 
         # v1.0.7 以前历史记录保存在配置中；这里兼容读取并迁移到插件数据。
         history = self.get_data("history") or []
@@ -181,7 +193,8 @@ class CD2Notify(_PluginBase):
         if self._test_notify:
             self._test_notify = False
             try:
-                self._send_test_notification()
+                if not self._send_test_notification():
+                    logger.error(f"{self.plugin_name}: 发送测试通知失败，请检查通知渠道配置")
                 self.update_config(self._current_config())
             except Exception as err:
                 logger.error(f"{self.plugin_name}: 发送测试通知失败 - {err}")
@@ -205,6 +218,79 @@ class CD2Notify(_PluginBase):
             return int(val)
         except Exception:
             return default
+
+    @classmethod
+    def _clamp_int(cls, val: Any, default: int, min_value: int, max_value: int) -> int:
+        number = cls._to_int(val, default)
+        return min(max(number, min_value), max_value)
+
+    @classmethod
+    def _safe_text(cls, val: Any, max_chars: Optional[int] = None) -> str:
+        text = "" if val is None else str(val)
+        limit = max_chars or cls._max_field_chars
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}……[已截断{len(text) - limit}字]"
+
+    @classmethod
+    def _truncate_text(cls, text: str, max_chars: Optional[int] = None) -> str:
+        value = text or ""
+        limit = max_chars or cls._max_history_detail_chars
+        if len(value) <= limit:
+            return value
+        return f"{value[:limit]}\n……已截断 {len(value) - limit} 字"
+
+    @classmethod
+    def _limit_change_items(cls, items: List[CD2ChangeItem]) -> Tuple[List[CD2ChangeItem], int]:
+        source_items = list(items or [])
+        limited = source_items[: cls._max_event_items]
+        sanitized = [
+            CD2ChangeItem(
+                action=cls._safe_text(item.action),
+                is_dir=item.is_dir,
+                source_file=cls._safe_text(item.source_file),
+                destination_file=cls._safe_text(item.destination_file),
+            )
+            for item in limited
+        ]
+        return sanitized, max(len(source_items) - len(sanitized), 0)
+
+    @classmethod
+    def _limit_mount_items(cls, items: List[CD2MountItem]) -> Tuple[List[CD2MountItem], int]:
+        source_items = list(items or [])
+        limited = source_items[: cls._max_event_items]
+        sanitized = [
+            CD2MountItem(
+                action=cls._safe_text(item.action),
+                mount_point=cls._safe_text(item.mount_point),
+                status=item.status,
+                reason=cls._safe_text(item.reason),
+            )
+            for item in limited
+        ]
+        return sanitized, max(len(source_items) - len(sanitized), 0)
+
+    def _sanitize_file_request(self, request: CD2NotifyRequest) -> int:
+        request.device_name = self._safe_text(request.device_name)
+        request.user_name = self._safe_text(request.user_name)
+        request.version = self._safe_text(request.version)
+        request.event_category = self._safe_text(request.event_category)
+        request.event_name = self._safe_text(request.event_name)
+        request.event_time = self._safe_text(request.event_time)
+        request.send_time = self._safe_text(request.send_time)
+        request.data, dropped = self._limit_change_items(request.data or [])
+        return dropped
+
+    def _sanitize_mount_request(self, request: CD2MountRequest) -> int:
+        request.device_name = self._safe_text(request.device_name)
+        request.user_name = self._safe_text(request.user_name)
+        request.version = self._safe_text(request.version)
+        request.event_category = self._safe_text(request.event_category)
+        request.event_name = self._safe_text(request.event_name)
+        request.event_time = self._safe_text(request.event_time)
+        request.send_time = self._safe_text(request.send_time)
+        request.data, dropped = self._limit_mount_items(request.data or [])
+        return dropped
 
     @staticmethod
     def _bool_text(value: Any) -> Tuple[bool, str]:
@@ -312,9 +398,9 @@ class CD2Notify(_PluginBase):
                 filtered.append(item)
         return filtered
 
-    def _send_test_notification(self):
+    def _send_test_notification(self) -> bool:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._send_mp_notice(
+        return self._send_mp_notice(
             "【☁️CloudDrive2】",
             "━━━━━━━━━━━━━━\n"
             "📊 本次变动：1 项\n"
@@ -352,8 +438,9 @@ class CD2Notify(_PluginBase):
         使用 MoviePilot 系统 API_TOKEN 作为唯一密钥；如果 MP 未配置
         API_TOKEN，接口一律拒绝，避免空 token 被误放行。
         """
-        token = getattr(settings, "API_TOKEN", "") or ""
-        return bool(token) and bool(apikey) and apikey == token
+        token = str(getattr(settings, "API_TOKEN", "") or "")
+        incoming = str(apikey or "")
+        return bool(token) and bool(incoming) and compare_digest(incoming.encode("utf-8"), token.encode("utf-8"))
 
     def _current_config(self) -> Dict[str, Any]:
         return {
@@ -532,7 +619,7 @@ class CD2Notify(_PluginBase):
             "other": counts["other"],
             "file": counts["file"],
             "dir": counts["dir"],
-            "detail": "\n".join(detail_preview),
+            "detail": self._truncate_text("\n".join(detail_preview)),
         }
         return title, "\n".join(text_lines), record
 
@@ -592,9 +679,29 @@ class CD2Notify(_PluginBase):
             "other": 0,
             "file": 0,
             "dir": 0,
-            "detail": "\n".join(history_detail_lines),
+            "detail": self._truncate_text("\n".join(history_detail_lines)),
         }
         return title, "\n".join(text_lines), record
+
+    def _cancel_pending_timer(self) -> None:
+        try:
+            if self._pending_timer:
+                self._pending_timer.cancel()
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}: 取消汇总通知定时器失败 - {err}")
+        finally:
+            self._pending_timer = None
+
+    def _discard_pending_file_notify(self, reason: str) -> None:
+        if not self._pending_lock:
+            self._pending_lock = Lock()
+        self._cancel_pending_timer()
+        with self._pending_lock:
+            dropped = len(self._pending_file_items or [])
+            self._pending_file_items = []
+            self._pending_file_meta = {}
+        if dropped:
+            logger.info(f"{self.plugin_name}: {reason}，共 {dropped} 项")
 
     def _queue_file_notify(self, payload: CD2NotifyRequest) -> None:
         """缓存 CloudDrive2 文件事件，等待一段静默时间后统一通知。"""
@@ -701,7 +808,10 @@ class CD2Notify(_PluginBase):
         """
         try:
             mtype = self._get_msgtype()
-            self.chain.post_message(Notification(mtype=mtype, title=title, text=text, link=None))
+            result = self.chain.post_message(Notification(mtype=mtype, title=title, text=text, link=None))
+            if result is False:
+                logger.error(f"{self.plugin_name}: MoviePilot 通知通道返回失败")
+                return False
             return True
         except Exception as err:
             logger.error(f"{self.plugin_name}: 发送 MoviePilot 通知失败 - {err}")
@@ -713,6 +823,9 @@ class CD2Notify(_PluginBase):
             return schemas.Response(success=False, message="API令牌错误")
         if not self._enabled:
             return schemas.Response(success=False, message="插件未启用")
+        dropped = self._sanitize_file_request(request)
+        if dropped:
+            logger.warning(f"{self.plugin_name}: CloudDrive2文件事件超过 {self._max_event_items} 项，已截断 {dropped} 项")
         request.data = self._filter_items_by_config(request.data or [])
         if not request.data:
             logger.warning(f"{self.plugin_name}: 收到CloudDrive2文件事件，但data为空，已忽略")
@@ -737,6 +850,9 @@ class CD2Notify(_PluginBase):
             return schemas.Response(success=False, message="API令牌错误")
         if not self._enabled:
             return schemas.Response(success=False, message="插件未启用")
+        dropped = self._sanitize_mount_request(request)
+        if dropped:
+            logger.warning(f"{self.plugin_name}: CloudDrive2挂载事件超过 {self._max_event_items} 项，已截断 {dropped} 项")
 
         title, text, record = self._build_mount_message(request)
         self._log_event("收到CloudDrive2挂载事件", title, text, record)
@@ -1221,8 +1337,4 @@ class CD2Notify(_PluginBase):
         ]
 
     def stop_service(self):
-        try:
-            if self._pending_timer:
-                self._pending_timer.cancel()
-        except Exception:
-            pass
+        self._discard_pending_file_notify("插件服务停止，丢弃待汇总文件事件")

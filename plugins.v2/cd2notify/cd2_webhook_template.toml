@@ -5,7 +5,7 @@
 # 1. base_url 改成你的 MoviePilot 地址，例如 http://192.168.1.100:3001
 # 2. apikey 改成你的 MoviePilot 系统 API_TOKEN
 #
-# 如果插件里开启“等待任务结束后通知”，CloudDrive2 模板不用改；
+# 如果插件里开启“启用汇总通知”，CloudDrive2 模板不用改；
 # 插件会自动把连续文件变化合并成一条汇总通知。
 
 [global_params]

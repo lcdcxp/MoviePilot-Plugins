@@ -41,7 +41,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "2.4"
+    plugin_version = "2.4.1"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -2016,6 +2016,8 @@ class LocalMetadataCleaner(_PluginBase):
                 reason="initial_missing_image",
                 deleted_nfo=0,
                 postcheck_batch_id=postcheck_batch_id,
+                scrape_target=target,
+                refresh_batch=refresh_batch,
             )
             scheduled_eps.append(episode_strm)
 
@@ -2510,11 +2512,27 @@ class LocalMetadataCleaner(_PluginBase):
         # 5. 追更单集，只检查该集。
         return episode_paths, "episode", episode_paths[0].parent if episode_paths else show_root
 
-    def _ensure_episode_scrape_task(self, state: Dict[str, Any], episode_strm: Path, show_root: Path, reason: str = "", deleted_nfo: int = 0, postcheck_batch_id: str = ""):
+    def _ensure_episode_scrape_task(
+        self,
+        state: Dict[str, Any],
+        episode_strm: Path,
+        show_root: Path,
+        reason: str = "",
+        deleted_nfo: int = 0,
+        postcheck_batch_id: str = "",
+        scrape_target: str = "",
+        refresh_batch: set = None,
+    ):
         queue = state.setdefault("queue", {})
         key = f"episode::{episode_strm}"
         due_ts = time.time() + max(self._episode_scrape_delay_seconds, 0)
-        target = self._map_episode_strm_to_scrape_target(episode_strm)
+        target = ""
+        if scrape_target:
+            target_path = Path(str(scrape_target))
+            if self._is_safe_episode_scrape_file(target_path):
+                target = str(target_path)
+        if not target:
+            target = self._map_episode_strm_to_scrape_target(episode_strm, refresh_batch=refresh_batch)
         existing = queue.get(key)
         if existing:
             # 如果旧任务里残留 .strm 目标，或者当前已能找到真实媒体文件，刷新成真实媒体路径。
@@ -4568,9 +4586,18 @@ class LocalMetadataCleaner(_PluginBase):
         return text.rstrip("/") if text != "/" else "/"
 
     @staticmethod
+    def _path_has_unsafe_segments(path_text: str) -> bool:
+        text = LocalMetadataCleaner._normalise_path_text(path_text)
+        return any(part in {".", ".."} for part in text.split("/") if part)
+
+    @staticmethod
     def _path_same_or_under(child: str, parent: str) -> bool:
         child = LocalMetadataCleaner._normalise_path_text(child)
         parent = LocalMetadataCleaner._normalise_path_text(parent)
+        if not child or not parent:
+            return False
+        if LocalMetadataCleaner._path_has_unsafe_segments(child) or LocalMetadataCleaner._path_has_unsafe_segments(parent):
+            return False
         if child == parent:
             return True
         return child.startswith(parent.rstrip("/") + "/")
@@ -4580,8 +4607,18 @@ class LocalMetadataCleaner(_PluginBase):
         path = LocalMetadataCleaner._normalise_path_text(path)
         left = LocalMetadataCleaner._normalise_path_text(left)
         right = LocalMetadataCleaner._normalise_path_text(right)
+        if not path or not left or not right:
+            return path
+        if (
+            LocalMetadataCleaner._path_has_unsafe_segments(path)
+            or LocalMetadataCleaner._path_has_unsafe_segments(left)
+            or LocalMetadataCleaner._path_has_unsafe_segments(right)
+        ):
+            return path
         if path == left:
             return right
+        if left == "/" and path.startswith("/"):
+            return right.rstrip("/") + path
         if path.startswith(left.rstrip("/") + "/"):
             return right.rstrip("/") + path[len(left):]
         return path

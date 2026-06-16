@@ -11,13 +11,14 @@ MoviePilot V2 插件：聚影签到
 """
 
 import datetime
+import ipaddress
 import json
 import os
 import random
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import pytz
 import requests
@@ -41,7 +42,7 @@ class JuyingCheckin(_PluginBase):
     plugin_name = "聚影签到"
     plugin_desc = "用于聚影自动签到，支持账号密码、多账号、定时执行、代理、失败重试和签到历史。感谢大胖提供的支持。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/signin.png"
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     plugin_author = "jidian"
     author_url = "https://share.huamucang.top"
     plugin_config_prefix = "juyingcheckin_"
@@ -69,6 +70,19 @@ class JuyingCheckin(_PluginBase):
     _clear_history: bool = False
     _check_proxy: bool = False
     _scheduler: Optional[BackgroundScheduler] = None
+    _default_site_url: str = "https://share.huamucang.top"
+    _sensitive_keys = {
+        "password",
+        "passwd",
+        "pwd",
+        "token",
+        "access_token",
+        "refresh_token",
+        "authorization",
+        "cookie",
+        "set-cookie",
+        "x-app-user-token",
+    }
 
     def init_plugin(self, config: dict = None):
         """读取配置并初始化插件。"""
@@ -79,9 +93,9 @@ class JuyingCheckin(_PluginBase):
         self._notify = self.__safe_bool(config.get("notify", True))
         self._onlyonce = self.__safe_bool(config.get("onlyonce", False))
         self._cron = str(config.get("cron") or "10 8 * * *").strip()
-        self._site_url = str(config.get("site_url") or "https://share.huamucang.top").strip().rstrip("/")
-        self._login_api = str(config.get("login_api") or "/api/app/login/").strip()
-        self._checkin_api = str(config.get("checkin_api") or "/api/app/checkin/do/").strip()
+        self._site_url = self.__normalize_site_url(config.get("site_url"), default=self._default_site_url)
+        self._login_api = self.__normalize_api_path(config.get("login_api"), default="/api/app/login/")
+        self._checkin_api = self.__normalize_api_path(config.get("checkin_api"), default="/api/app/checkin/do/")
         self._username = str(config.get("username") or "").strip()
         self._password = str(config.get("password") or config.get("usr_password") or "").strip()
         self._accounts = str(config.get("accounts") or "").strip()
@@ -158,7 +172,7 @@ class JuyingCheckin(_PluginBase):
             # 明确指定时区，避免部分环境下按 UTC 触发，导致 08:10 实际变成 16:10。
             trigger = CronTrigger.from_crontab(self._cron, timezone=tz)
         except Exception as err:
-            logger.error(f"聚影签到：cron 表达式不正确：{self._cron}，错误：{err}")
+            logger.error(f"聚影签到：cron 表达式不正确：{self._cron}，错误：{self.__sanitize_log_text(err)}")
             return []
         logger.info(f"聚影签到：已注册定时服务，cron={self._cron}，timezone={tz.zone}")
         return [
@@ -227,7 +241,7 @@ class JuyingCheckin(_PluginBase):
                     self._scheduler.shutdown()
                 self._scheduler = None
         except Exception as err:
-            logger.error(f"聚影签到：停止服务失败：{err}")
+            logger.error(f"聚影签到：停止服务失败：{self.__sanitize_log_text(err)}")
 
     def _scheduled_checkin(self):
         """定时任务入口；按配置执行随机延迟。"""
@@ -278,7 +292,7 @@ class JuyingCheckin(_PluginBase):
                         user_info["points_awarded_latest"] = result.get("points")
                     except Exception:
                         pass
-                self.save_data("profile", user_info)
+                self.save_data("profile", self.__redact_sensitive_obj(user_info))
 
         total = len(accounts)
         title = self.__build_notify_title(
@@ -321,7 +335,7 @@ class JuyingCheckin(_PluginBase):
             try:
                 result = self.__login_and_checkin(username=username, password=password)
             except Exception as err:
-                logger.error(f"聚影签到：账号 {self.__mask_account(username)} 第 {attempt}/{max_attempts} 次执行失败：{err}")
+                logger.error(f"聚影签到：账号 {self.__mask_account(username)} 第 {attempt}/{max_attempts} 次执行失败：{self.__sanitize_log_text(err)}")
                 result = {
                     "success": False,
                     "already": False,
@@ -345,14 +359,14 @@ class JuyingCheckin(_PluginBase):
 
             if not result.get("retryable"):
                 logger.warning(
-                    f"聚影签到：账号 {self.__mask_account(username)} 返回明确失败，不再重试。原因：{result.get('message') or '未知错误'}"
+                    f"聚影签到：账号 {self.__mask_account(username)} 返回明确失败，不再重试。原因：{self.__sanitize_log_text(result.get('message') or '未知错误')}"
                 )
                 return result
 
             if attempt < max_attempts:
                 logger.warning(
                     f"聚影签到：账号 {self.__mask_account(username)} 签到失败，{self._retry_interval} 秒后重试 "
-                    f"{attempt + 1}/{max_attempts}。原因：{result.get('message') or '未知错误'}"
+                    f"{attempt + 1}/{max_attempts}。原因：{self.__sanitize_log_text(result.get('message') or '未知错误')}"
                 )
                 if self._retry_interval > 0:
                     time.sleep(self._retry_interval)
@@ -364,6 +378,7 @@ class JuyingCheckin(_PluginBase):
         login_url = self.__build_url(self._login_api)
         checkin_url = self.__build_url(self._checkin_api)
         session = requests.Session()
+        session.trust_env = False
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
@@ -380,7 +395,7 @@ class JuyingCheckin(_PluginBase):
             timeout=(self._connect_timeout, self._read_timeout),
         )
         login_data = self.__response_to_json(login_resp)
-        user_info = login_data.get("user") if isinstance(login_data.get("user"), dict) else {}
+        user_info = self.__pick_user_info(login_data)
 
         if not self.__is_login_success(login_data):
             return {
@@ -423,9 +438,8 @@ class JuyingCheckin(_PluginBase):
         used_proxy = bool(login_used_proxy or checkin_used_proxy)
 
         message = self.__pick_message(checkin_data)
-        status = str(checkin_data.get("status") or checkin_data.get("code") or "").lower()
-        already = any(key in message for key in ["已签到", "已经签到", "今日已", "重复签到", "明天再来"])
-        success = status == "success" or checkin_data.get("success") is True
+        already = self.__is_already_checkin_message(message)
+        success = self.__is_success_payload(checkin_data) and not already
         # 成功优先；如果接口把“已签到”放在 400 JSON 中返回，则按已签到处理，不触发重试。
         if success:
             already = False
@@ -463,21 +477,15 @@ class JuyingCheckin(_PluginBase):
                 line = line.strip().strip("'").strip('"')
                 if not line:
                     continue
-                parts.extend([item.strip() for item in line.split("@") if item.strip()])
+                parts.extend(self.__split_account_items(line))
 
             for item in parts:
-                username = ""
-                password = ""
-                if "#" in item:
-                    username, password = item.split("#", 1)
-                elif "|" in item:
-                    username, password = item.split("|", 1)
-                elif "," in item:
-                    username, password = item.split(",", 1)
-                else:
+                parsed = self.__split_account_pair(item)
+                if not parsed:
                     if not silent:
-                        logger.warning(f"聚影签到：忽略格式不正确的账号配置：{item}")
+                        logger.warning("聚影签到：忽略一条格式不正确的账号配置")
                     continue
+                username, password = parsed
                 username = username.strip()
                 password = password.strip()
                 if username:
@@ -498,19 +506,68 @@ class JuyingCheckin(_PluginBase):
         raw = (raw or "").strip()
         if not raw:
             return ""
-        match = re.search(r"JUYING_ACCOUNT\s*=\s*['\"]?(.+?)['\"]?\s*$", raw, flags=re.I | re.S)
+        match = re.search(r"(?:^|\s)(?:export\s+)?JUYING_ACCOUNT\s*=\s*(['\"]?)(.*?)\1\s*$", raw, flags=re.I | re.S)
         if match:
-            return match.group(1).strip()
+            return match.group(2).strip()
         return raw
+
+    @staticmethod
+    def __split_account_items(line: str) -> List[str]:
+        """拆分青龙多账号，避免把邮箱用户名或密码中的 @ 当成账号分隔符。"""
+        items: List[str] = []
+        current: List[str] = []
+        for index, char in enumerate(line):
+            if char == "@" and current:
+                current_text = "".join(current)
+                next_text = line[index + 1 :]
+                if JuyingCheckin.__has_account_delimiter(current_text) and JuyingCheckin.__looks_like_account_start(next_text):
+                    item = current_text.strip()
+                    if item:
+                        items.append(item)
+                    current = []
+                    continue
+            current.append(char)
+        item = "".join(current).strip()
+        if item:
+            items.append(item)
+        return items
+
+    @staticmethod
+    def __split_account_pair(item: str) -> Optional[Tuple[str, str]]:
+        for delimiter in ["#", "|", ","]:
+            if delimiter in item:
+                username, password = item.split(delimiter, 1)
+                return username, password
+        return None
+
+    @staticmethod
+    def __has_account_delimiter(text: str) -> bool:
+        return any(delimiter in text for delimiter in ["#", "|", ","])
+
+    @staticmethod
+    def __looks_like_account_start(text: str) -> bool:
+        delimiter_positions = [pos for pos in [text.find("#"), text.find("|"), text.find(",")] if pos > 0]
+        if not delimiter_positions:
+            return False
+        username = text[: min(delimiter_positions)].strip()
+        if not username:
+            return False
+        if username.count("@") > 1:
+            return False
+        if "@" in username:
+            name, domain = username.split("@", 1)
+            return bool(name and "." in domain and not domain.startswith(".") and not domain.endswith("."))
+        return True
 
     def __build_url(self, api_path: str) -> str:
         api_path = (api_path or "").strip()
         if api_path.startswith("http://") or api_path.startswith("https://"):
-            return api_path
-        return urljoin(self._site_url.rstrip("/") + "/", api_path.lstrip("/"))
+            return self.__validate_request_url(api_path)
+        return self.__validate_request_url(urljoin(self._site_url.rstrip("/") + "/", api_path.lstrip("/")))
 
     def __request(self, session: requests.Session, method: str, url: str, **kwargs) -> Tuple[requests.Response, bool]:
         """按配置直连或使用 MoviePilot 的 PROXY_HOST 代理请求。"""
+        url = self.__validate_request_url(url)
         if self._use_proxy:
             proxy_host = self.__get_mp_proxy_host()
             if not proxy_host:
@@ -520,12 +577,80 @@ class JuyingCheckin(_PluginBase):
                 logger.info(f"聚影签到：使用 MP 代理请求：{url}")
                 return session.request(method=method, url=url, proxies=proxies, **kwargs), True
             except requests.exceptions.RequestException as proxy_err:
-                raise RuntimeError(f"MP代理请求失败：{proxy_err}") from proxy_err
+                raise RuntimeError(f"MP代理请求失败：{self.__sanitize_log_text(proxy_err)}") from proxy_err
 
         try:
             return session.request(method=method, url=url, **kwargs), False
         except requests.exceptions.RequestException as direct_err:
-            raise RuntimeError(f"直连请求失败：{direct_err}") from direct_err
+            raise RuntimeError(f"直连请求失败：{self.__sanitize_log_text(direct_err)}") from direct_err
+
+    def __normalize_site_url(self, value: Any, default: str) -> str:
+        url = str(value or default).strip().rstrip("/")
+        if url and "://" not in url:
+            url = "https://" + url
+        try:
+            return self.__validate_request_url(url).rstrip("/")
+        except Exception as err:
+            logger.warning(f"聚影签到：站点地址不安全或不正确，已回退默认地址。原因：{self.__sanitize_log_text(err)}")
+            return default.rstrip("/")
+
+    def __normalize_api_path(self, value: Any, default: str) -> str:
+        api_path = str(value or default).strip() or default
+        if api_path.startswith("http://") or api_path.startswith("https://"):
+            try:
+                api_url = self.__validate_request_url(api_path)
+                site = urlparse(self._site_url)
+                parsed = urlparse(api_url)
+                if self.__origin(parsed) != self.__origin(site):
+                    raise ValueError("接口地址必须与站点地址同源")
+                return urlunparse(("", "", parsed.path or "/", "", parsed.query, ""))
+            except Exception as err:
+                logger.warning(f"聚影签到：接口地址不安全或不正确，已回退默认接口。原因：{self.__sanitize_log_text(err)}")
+                return default
+        if not api_path.startswith("/"):
+            api_path = "/" + api_path
+        return api_path
+
+    @staticmethod
+    def __origin(parsed) -> Tuple[str, str, Optional[int]]:
+        scheme = (parsed.scheme or "").lower()
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+        if port is None:
+            port = 443 if scheme == "https" else 80 if scheme == "http" else None
+        return scheme, host, port
+
+    def __validate_request_url(self, url: str) -> str:
+        parsed = urlparse(str(url or "").strip())
+        if parsed.scheme.lower() != "https":
+            raise ValueError("仅允许 HTTPS 地址，避免账号密码或 token 明文传输")
+        if not parsed.hostname:
+            raise ValueError("地址缺少主机名")
+        if self.__is_unsafe_host(parsed.hostname):
+            raise ValueError("不允许请求本机、内网或保留地址")
+        if parsed.username or parsed.password:
+            raise ValueError("地址中不允许包含用户名或密码")
+        return urlunparse(parsed)
+
+    @staticmethod
+    def __is_unsafe_host(hostname: str) -> bool:
+        host = str(hostname or "").strip().strip("[]").lower().rstrip(".")
+        if host in ["localhost", "ip6-localhost", "ip6-loopback"]:
+            return True
+        if host.endswith(".localhost") or host.endswith(".local"):
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return bool(
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
 
     @staticmethod
     def __get_mp_proxy_host() -> str:
@@ -534,6 +659,39 @@ class JuyingCheckin(_PluginBase):
         if proxy_host.lower() in ["", "none", "null", "false"]:
             return ""
         return proxy_host
+
+    @staticmethod
+    def __sanitize_log_text(value: Any) -> str:
+        text = str(value or "")
+        text = re.sub(r"(?i)(https?://)([^:/@\s]+):([^@\s]+)@", r"\1***:***@", text)
+        text = re.sub(
+            r"(?i)(password|passwd|pwd|token|access_token|refresh_token|authorization|cookie|x-app-user-token)([\"'\s:=]+)([^\"'\s,&}]+)",
+            r"\1\2***",
+            text,
+        )
+        return text
+
+    @staticmethod
+    def __redact_sensitive_obj(value: Any) -> Any:
+        if isinstance(value, dict):
+            redacted = {}
+            for key, item in value.items():
+                if str(key).lower() in JuyingCheckin._sensitive_keys:
+                    redacted[key] = "***"
+                else:
+                    redacted[key] = JuyingCheckin.__redact_sensitive_obj(item)
+            return redacted
+        if isinstance(value, list):
+            return [JuyingCheckin.__redact_sensitive_obj(item) for item in value[:20]]
+        return value
+
+    @staticmethod
+    def __safe_json_preview(value: Any, limit: int = 300) -> str:
+        try:
+            text = json.dumps(JuyingCheckin.__redact_sensitive_obj(value), ensure_ascii=False)
+        except Exception:
+            text = str(value)
+        return JuyingCheckin.__sanitize_log_text(text)[:limit]
 
     @staticmethod
     def __get_timezone():
@@ -557,16 +715,16 @@ class JuyingCheckin(_PluginBase):
                 if not resp.ok:
                     data.setdefault("_http_status", resp.status_code)
                 return data
-            return {"status": "not_dict", "message": json.dumps(data, ensure_ascii=False)[:500]}
+            return {"status": "not_dict", "message": JuyingCheckin.__safe_json_preview(data, limit=500)}
         except ValueError:
             pass
 
         try:
             resp.raise_for_status()
         except Exception as err:
-            text = resp.text[:500] if resp.text else ""
-            return {"status": "http_error", "message": f"{err} {text}"}
-        return {"status": "not_json", "message": resp.text[:500]}
+            text = JuyingCheckin.__sanitize_log_text(resp.text[:500] if resp.text else "")
+            return {"status": "http_error", "message": JuyingCheckin.__sanitize_log_text(f"{err} {text}")}
+        return {"status": "not_json", "message": JuyingCheckin.__sanitize_log_text(resp.text[:500])}
 
     @staticmethod
     def __is_login_success(data: Dict[str, Any]) -> bool:
@@ -576,9 +734,59 @@ class JuyingCheckin(_PluginBase):
             return True
         if data.get("success") is True:
             return True
-        if data.get("code") in [0, 200, "0", "200"] and JuyingCheckin.__pick_token(data):
+        token = JuyingCheckin.__pick_token(data)
+        if data.get("code") in [0, 200, "0", "200"] and token:
             return True
-        return bool(JuyingCheckin.__pick_token(data))
+        return bool(token and not JuyingCheckin.__has_failure_signal(data))
+
+    @staticmethod
+    def __is_success_payload(data: Dict[str, Any]) -> bool:
+        if not isinstance(data, dict):
+            return False
+        status = str(data.get("status") or "").lower()
+        if status in ["success", "ok", "true"]:
+            return True
+        if data.get("success") is True:
+            return True
+        if data.get("code") in [0, 200, "0", "200"]:
+            return not JuyingCheckin.__has_failure_signal(data)
+        message = JuyingCheckin.__pick_message(data)
+        return JuyingCheckin.__has_success_message(message) and not JuyingCheckin.__has_failure_signal(data)
+
+    @staticmethod
+    def __has_failure_signal(data: Dict[str, Any]) -> bool:
+        status = str(data.get("status") or "").lower()
+        if status in ["fail", "failed", "failure", "error", "false"]:
+            return True
+        success = data.get("success")
+        if success is False:
+            return True
+        message = str(data.get("message") or data.get("msg") or data.get("error") or "").lower()
+        if JuyingCheckin.__has_success_message(message):
+            return False
+        if any(
+            key in message
+            for key in [
+                "失败",
+                "错误",
+                "无效",
+                "不存在",
+                "密码",
+                "未登录",
+                "unauthorized",
+                "invalid",
+                "incorrect",
+                "forbidden",
+                "error",
+            ]
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def __has_success_message(message: str) -> bool:
+        text = str(message or "").lower()
+        return any(key in text for key in ["签到成功", "成功签到", "登录成功", "checkin success", "login success", "successfully"])
 
     @staticmethod
     def __pick_token(data: Dict[str, Any]) -> str:
@@ -595,13 +803,26 @@ class JuyingCheckin(_PluginBase):
         return ""
 
     @staticmethod
+    def __pick_user_info(data: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            return {}
+        for container in [data, data.get("data"), data.get("result")]:
+            if isinstance(container, dict) and isinstance(container.get("user"), dict):
+                return container.get("user") or {}
+        return {}
+
+    @staticmethod
     def __pick_message(data: Dict[str, Any]) -> str:
         if not isinstance(data, dict):
             return str(data)
         for key in ["message", "msg", "detail", "error"]:
             if data.get(key):
-                return str(data.get(key))
-        return json.dumps(data, ensure_ascii=False)[:300]
+                return JuyingCheckin.__sanitize_log_text(data.get(key))
+        return JuyingCheckin.__safe_json_preview(data, limit=300)
+
+    @staticmethod
+    def __is_already_checkin_message(message: str) -> bool:
+        return any(key in str(message or "") for key in ["已签到", "已经签到", "今日已", "重复签到", "明天再来"])
 
     @staticmethod
     def __first_not_none(data: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
@@ -676,7 +897,7 @@ class JuyingCheckin(_PluginBase):
     def __format_result_lines(result: Dict[str, Any]) -> List[str]:
         status_text, status_icon, _ = JuyingCheckin.__status_meta(result)
         account = JuyingCheckin.__mask_account(result.get("username") or "")
-        message = str(result.get("message") or "无返回信息").strip()
+        message = JuyingCheckin.__sanitize_log_text(result.get("message") or "无返回信息").strip()
         points = result.get("points", 0)
         days = result.get("days", 0)
         network = "代理" if result.get("proxy") else "直连"
@@ -723,7 +944,7 @@ class JuyingCheckin(_PluginBase):
 
     @staticmethod
     def __friendly_error(err: Exception) -> str:
-        text = str(err)
+        text = JuyingCheckin.__sanitize_log_text(err)
         if "Connection reset" in text or "ConnectionResetError" in text or "reset by peer" in text:
             return "网络异常：连接被重置。建议开启“使用代理”，并确认 MP 的 PROXY_HOST 可用。"
         if "timed out" in text or "Read timed out" in text or "ConnectTimeout" in text:
@@ -752,7 +973,7 @@ class JuyingCheckin(_PluginBase):
             else:
                 self.post_message(title=title, text=text)
         except Exception as err:
-            logger.error(f"聚影签到：发送通知失败：{err}")
+            logger.error(f"聚影签到：发送通知失败：{self.__sanitize_log_text(err)}")
 
     @staticmethod
     def __get_notification_type(notify_type: str):
@@ -787,6 +1008,7 @@ class JuyingCheckin(_PluginBase):
         """保存最近签到结果和历史表格数据。"""
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
+            safe_text = self.__sanitize_log_text(text)
             history = self.get_data("history") or []
             for result in results:
                 status_text, _, status_color = self.__status_meta(result)
@@ -804,7 +1026,7 @@ class JuyingCheckin(_PluginBase):
                         "max_attempts": result.get("max_attempts", 1),
                         "is_retry_task": int(result.get("attempt") or 1) > 1,
                         "network": "代理" if result.get("proxy") else "直连",
-                        "message": result.get("message") or "--",
+                        "message": self.__sanitize_log_text(result.get("message") or "--"),
                     }
                 )
             if not results:
@@ -822,7 +1044,7 @@ class JuyingCheckin(_PluginBase):
                         "max_attempts": 0,
                         "is_retry_task": False,
                         "network": "--",
-                        "message": text,
+                        "message": safe_text,
                     }
                 )
 
@@ -832,8 +1054,8 @@ class JuyingCheckin(_PluginBase):
                 {
                     "timestamp": now,
                     "title": title,
-                    "text": text,
-                    "message": self.__compact_message(text),
+                    "text": safe_text,
+                    "message": self.__compact_message(safe_text),
                     "success": bool(results) and all(r.get("success") or r.get("already") for r in results),
                     "has_fail": any(not (r.get("success") or r.get("already")) for r in results),
                     "total": len(results),
@@ -841,7 +1063,7 @@ class JuyingCheckin(_PluginBase):
                 },
             )
         except Exception as err:
-            logger.error(f"聚影签到：保存历史记录失败：{err}")
+            logger.error(f"聚影签到：保存历史记录失败：{self.__sanitize_log_text(err)}")
 
     @staticmethod
     def __compact_message(text: str) -> str:
@@ -944,10 +1166,11 @@ class JuyingCheckin(_PluginBase):
             "timestamp": now,
             "ok": False,
             "message": "未检测",
-            "proxy_host": self.__get_mp_proxy_host() or "--",
+            "proxy_host": self.__sanitize_log_text(self.__get_mp_proxy_host() or "--"),
         }
         try:
             session = requests.Session()
+            session.trust_env = False
             url = self.__build_url(self._login_api)
             headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*"}
             if self._use_proxy:
