@@ -41,7 +41,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "2.4.1"
+    plugin_version = "2.5"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -3349,19 +3349,34 @@ class LocalMetadataCleaner(_PluginBase):
         func = getattr(chain, method_name, None)
         if not callable(func):
             return False, ""
-        attempts = (
-            lambda: func(storage=self._storage, path=path),
-            lambda: func(path=path, storage=self._storage),
-            lambda: func(self._storage, path),
-            lambda: func(path),
-            lambda: func(str(path)),
-        )
+        lower_name = method_name.lower()
+        is_list_method = any(token in lower_name for token in ("list", "files", "items"))
+
+        if method_name == "list_files":
+            try:
+                fileitem = chain.get_file_item(storage=self._storage, path=path)
+            except Exception as err:
+                return False, str(err)
+            if not fileitem:
+                return False, f"get_file_item({path}) 返回空结果"
+            attempts = (
+                lambda: func(fileitem=fileitem),
+                lambda: func(fileitem, recursion=False),
+                lambda: func(fileitem),
+            )
+        else:
+            attempts = (
+                lambda: func(storage=self._storage, path=path),
+                lambda: func(path=path, storage=self._storage),
+                lambda: func(self._storage, path),
+                lambda: func(path),
+                lambda: func(str(path)),
+            )
         last_err = ""
         for attempt in attempts:
             try:
                 value = attempt()
-                lower_name = method_name.lower()
-                if any(token in lower_name for token in ("list", "files", "items")):
+                if is_list_method:
                     if value:
                         return True, f"{method_name}({path})"
                     last_err = f"{method_name}({path}) 返回空结果"
