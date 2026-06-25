@@ -8,7 +8,7 @@
 | --- | --- | --- | --- |
 | CD2Notify | CloudDrive2通知 | v1.2 | plugins.v2/cd2notify |
 | JuyingCheckin | 聚影签到 | v1.3 | plugins.v2/juyingcheckin |
-| LocalMetadataCleaner | 监控strm刮削网盘 | v2.5 | plugins.v2/localmetadatacleaner |
+| LocalMetadataCleaner | 监控strm刮削网盘 | v2.7.12 | plugins.v2/localmetadatacleaner |
 
 ## 更新说明
 
