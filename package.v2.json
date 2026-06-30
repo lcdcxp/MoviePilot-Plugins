@@ -44,7 +44,7 @@
     "name": "监控strm刮削网盘",
     "description": "复用 MP 全局入库事件：检查 STRM 刮削信息，需要时通过 CD2 挂载网盘路径触发 MP 刮削。",
     "labels": "STRM,Emby,网盘,刮削",
-    "version": "2.7.12",
+    "version": "2.8.1",
     "icon": "https://movie-pilot.org/assets/icon.png",
     "author": "jidian",
     "level": 1,
@@ -88,7 +88,8 @@
       "v2.7.9": "修正详情页历史记录的通知语义：触发刮削只作为处理记录展示，不再显示“已合并通知”，并从通知入口排除已触发刮削结果。",
       "v2.7.10": "按 CloudDrive2通知源码重调详情页顶部四个指标卡：VCard 直接使用 variant=tonal 与 success、info、success、primary 语义色，不再给顶部指标卡额外写背景色或颜色映射。",
       "v2.7.11": "统一详情页所有紫色为 MoviePilot/Vuetify primary：历史标题图标与编号、已合并通知 chip、单集刮削 chip、整组执行按钮和刮削集标签均改用 primary，旧 purple/deep-purple 仅作为兼容别名映射到 primary。",
-      "v2.7.12": "按 CloudDrive2通知的四种语义色统一详情页颜色：success 绿、info 蓝、warning 黄、primary 紫；长期复查改用 warning 黄色，删除/失败/等待重试等状态也收敛到四种颜色内。"
+      "v2.7.12": "按 CloudDrive2通知的四种语义色统一详情页颜色：success 绿、info 蓝、warning 黄、primary 紫；长期复查改用 warning 黄色，删除/失败/等待重试等状态也收敛到四种颜色内。",
+      "v2.8.1": "新增跨批次幂等保护；通知层只保留最终成功、最终复查结果和真正失败，加入长期复查/创建补刮削任务等中间态不再站内通知；详情页改为“最近记录”，同一集的排队、触发刮削、检查结果合并展示并去除重复记录；刮削成功通知改为图标化清爽模板并兼容单集/批量/电影/整剧季混合场景。"
     }
   }
 }

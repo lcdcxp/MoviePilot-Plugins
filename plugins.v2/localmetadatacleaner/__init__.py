@@ -48,7 +48,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "2.7.12"
+    plugin_version = "2.8.1"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -66,6 +66,10 @@ class LocalMetadataCleaner(_PluginBase):
     DEFAULT_SCRAPE_PATH_REFRESH_INTERVAL_SECONDS = 600
     DEFAULT_QUEUE_EXCEPTION_RETRY_DELAYS_SECONDS = [60, 300, 900]
     DEFAULT_SCOPE_ACCESS_RETRY_DELAYS_SECONDS = [60, 300, 900]
+    # 防止同一媒体库/同一 Season 在短时间内重复入库事件造成重复刮削。
+    DEFAULT_INITIAL_TV_SCOPE_COOLDOWN_SECONDS = 300
+    # 单集刮削成功后，在刮削后检查窗口内不再重复触发同一集刮削。
+    DEFAULT_EPISODE_SCRAPE_COOLDOWN_EXTRA_SECONDS = 120
     MAX_SEASON_POSTCHECK_RESCRAPES = 1
     DEFAULT_TARGET_DEPTH = 3
     DEFAULT_STORAGE = "local"
@@ -576,14 +580,23 @@ class LocalMetadataCleaner(_PluginBase):
             {"component": "VBtn", "props": {"variant": "tonal", "color": self._ui_color("warning"), "size": "small", "prepend-icon": "mdi-broom"}, "text": "清空历史记录", "events": {"click": {"api": "plugin/LocalMetadataCleaner/history_clear", "method": "get", "params": {"apikey": getattr(settings, "API_TOKEN", "")}}}}
         ]
         content: List[Dict[str, Any]] = [
-            self._workbench_section_header("2.", "最近记录 / 历史记录", "", actions)
+            self._workbench_section_header("2.", "最近记录", "", actions)
         ]
+        # failure_display 只是补充较早的失败/异常记录，不能和 history_display 重复渲染；
+        # 先放最近记录，再补充未出现过的失败记录，最后统一分组，避免同一集同时出现在两块里。
+        display_items: List[Dict[str, Any]] = []
+        seen_display = set()
+        for source in (history_display or [], failure_display or []):
+            if not isinstance(source, dict):
+                continue
+            key = self._history_display_identity(source)
+            if key in seen_display:
+                continue
+            seen_display.add(key)
+            display_items.append(source)
         panels: List[Dict[str, Any]] = []
-        if failure_display:
-            failure_groups = self._history_display_groups(failure_display)
-            panels.extend([self._history_group_panel(group) for group in failure_groups])
-        if history_display:
-            history_groups = self._history_display_groups(history_display)
+        if display_items:
+            history_groups = self._history_display_groups(display_items)
             panels.extend([self._history_group_panel(group) for group in history_groups])
         if panels:
             content.append({"component": "VExpansionPanels", "props": {"variant": "accordion", "class": "mt-3"}, "content": panels})
@@ -994,7 +1007,11 @@ class LocalMetadataCleaner(_PluginBase):
             labels, episode_total = self._history_item_episode_summary(item)
             if labels:
                 category = "episode"
-            if identity and outcome in aggregate_outcomes:
+            if identity and labels:
+                # 同一部剧同一集的“排队补刮 → 已触发刮削 → 检查完成/失败”等连续事项
+                # 合并到一个面板里，面板状态使用最近一条记录，详情里展示完整过程。
+                key = ("episode_flow", media_type, media_name, identity, *[str(x) for x in labels])
+            elif identity and outcome in aggregate_outcomes:
                 key = (outcome, media_type, media_name, identity)
             else:
                 key = (action, str(item.get("scope") or ""), str(item.get("folder") or ""), str(index))
@@ -1033,6 +1050,19 @@ class LocalMetadataCleaner(_PluginBase):
             group["episode_total"] = max(int(group.get("episode_total") or 0), int(episode_total or 0), len(old_labels))
         return groups
 
+    def _history_display_identity(self, item: Dict[str, Any]) -> Tuple[str, ...]:
+        """详情页展示去重键：只去掉失败补充列表和最近列表中的同一条历史。"""
+        if not isinstance(item, dict):
+            return ("invalid", str(id(item)))
+        action = str(item.get("action") or "")
+        return (
+            "record",
+            action,
+            str(item.get("scope") or ""),
+            str(item.get("folder") or ""),
+            str(item.get("time") or ""),
+        )
+
     def _history_item_episode_summary(self, item: Dict[str, Any]) -> Tuple[List[str], int]:
         labels: List[str] = []
         total = 0
@@ -1064,7 +1094,12 @@ class LocalMetadataCleaner(_PluginBase):
             chips.append(self._chip(f"{episode_total}/{episode_total}", "info"))
         categories = self._to_list(group.get("categories") or [])
         merged = len(items) > 1 or episode_total > 1 or len(categories) > 1
+        notified_count = 0
         if merged and self._history_outcome_sends_notification(outcome):
+            for item in items:
+                if self._notification_entry(item):
+                    notified_count += 1
+        if notified_count > 1:
             chips.append(self._chip("已合并通知", "primary"))
         elif len(items) > 1:
             chips.append(self._chip(f"{len(items)} 条记录", "info"))
@@ -1090,8 +1125,6 @@ class LocalMetadataCleaner(_PluginBase):
             "刮削成功",
             "复查完成",
             "复查结束",
-            "等待长期复查",
-            "待补刮削",
             "需关注",
             "刮削失败",
         }
@@ -1106,8 +1139,10 @@ class LocalMetadataCleaner(_PluginBase):
         ]}
 
     def _history_detail_line(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        outcome, color = self._history_outcome(item)
+        icon = "mdi-alert-circle" if color == "warning" else "mdi-check-circle"
         return {"component": "div", "props": {"class": "d-flex align-center ga-2"}, "content": [
-            {"component": "VIcon", "props": {"color": self._ui_color("success"), "size": "small"}, "text": "mdi-check-circle"},
+            {"component": "VIcon", "props": {"color": self._ui_color(color), "size": "small"}, "text": icon},
             {"component": "span", "props": {"class": "text-body-2"}, "text": self._history_detail_line_text(item)}
         ]}
 
@@ -1119,7 +1154,21 @@ class LocalMetadataCleaner(_PluginBase):
             if labels:
                 break
         if labels:
-            return f"{action}：{self._episode_range_text(labels)} 已完成"
+            outcome, _color = self._history_outcome(item)
+            suffix_map = {
+                "刮削成功": "检查完成",
+                "复查完成": "复查完成",
+                "复查结束": "复查结束",
+                "等待长期复查": "已加入长期复查",
+                "待补刮削": "已创建补刮削任务",
+                "已触发刮削": "已触发刮削",
+                "等待重试": "等待重试",
+                "已完整": "已完整",
+                "需关注": "需关注",
+                "刮削失败": "失败",
+            }
+            suffix = suffix_map.get(outcome, "已记录")
+            return f"{action}：{self._episode_range_text(labels)} {suffix}"
         msg = str(item.get("scrape_msg") or item.get("note") or "").strip()
         return f"{action}：{msg}" if msg else f"{action}：完成"
 
@@ -1458,7 +1507,17 @@ class LocalMetadataCleaner(_PluginBase):
         if item.get("scrape") is False:
             return True
         action = str(item.get("action") or "").lower()
-        failure_words = ["failed", "target_missing", "show_missing", "manual_missing", "postcheck_incomplete", "recheck_missing", "missing_schedule_recheck"]
+        # 这里只保留真正需要关注的失败/异常。排队类动作（加入长期复查、创建补刮削任务）
+        # 不应进入失败补充列表，否则会和最近记录重复展示。
+        failure_words = [
+            "failed",
+            "target_missing",
+            "scope_rejected",
+            "target_rejected",
+            "nfo_delete_failed",
+            "postcheck_incomplete",
+            "queue_task_exception_failed",
+        ]
         return any(word in action for word in failure_words)
 
     def stop_service(self):
@@ -1611,6 +1670,10 @@ class LocalMetadataCleaner(_PluginBase):
                 self._restore_queue_timers(state)
                 return {"success": True, "duplicate": True, "message": "重复入库事件已合并", "task": task_key}
 
+            if info.get("media_type") == "tv" and self._is_recent_initial_tv_duplicate(state, task_key, info, now_ts):
+                self.save_data("state", state)
+                return {"success": True, "duplicate": True, "ignored": True, "message": "近期同一电视剧入库范围已处理，已跳过重复事件", "task": task_key}
+
             task = {
                 "task_type": "initial",
                 "key": task_key,
@@ -1755,6 +1818,7 @@ class LocalMetadataCleaner(_PluginBase):
                     self._next_timer_due_ts = 0
                 done = 0
                 changed = bool(self._prune_stale_markers(state, now_ts=now_ts))
+                changed = bool(self._prune_recent_dedupe_state(state, now_ts=now_ts)) or changed
                 remove_keys: List[str] = []
                 for key, task in list(queue.items()):
                     # 队列处理过程中，前面的任务可能已经同步删除了后面的旧复查任务；
@@ -2327,6 +2391,9 @@ class LocalMetadataCleaner(_PluginBase):
         task["resolved_scan_scope"] = scan_scope_type
         task["resolved_scan_path"] = str(scan_scope_path or "")
 
+        if episode_paths:
+            self._remember_initial_tv_scope(state, task, episode_paths, scan_scope_type, scan_scope_path)
+
         if not episode_paths:
             result = {
                 "time": self._now_iso(), "action": "tv_initial_no_existing_episode_skip", "scope": str(show_root),
@@ -2583,6 +2650,7 @@ class LocalMetadataCleaner(_PluginBase):
         # 3. 对所有缺图集触发单集补刮削。剧/季目录刮削不影响单集刮削和 10 分钟检查。
         scheduled_eps: List[Path] = []
         shared_trigger_eps: List[Path] = []
+        recent_skip_eps: List[Path] = []
         metadata_wait_eps: List[Path] = []
         target_missing_eps: List[Path] = []
         metadata_wait_set = {str(x) for x in self._unique_episode_paths(metadata_scrape_episodes)}
@@ -2607,7 +2675,7 @@ class LocalMetadataCleaner(_PluginBase):
                 continue
             if not target:
                 target_missing_eps.append(episode_strm)
-            self._ensure_episode_scrape_task(
+            created = self._ensure_episode_scrape_task(
                 state,
                 episode_strm,
                 show_root,
@@ -2617,7 +2685,10 @@ class LocalMetadataCleaner(_PluginBase):
                 scrape_target=target,
                 refresh_batch=refresh_batch,
             )
-            scheduled_eps.append(episode_strm)
+            if created:
+                scheduled_eps.append(episode_strm)
+            else:
+                recent_skip_eps.append(episode_strm)
 
         wait_check_eps = self._unique_episode_paths(metadata_wait_eps + shared_trigger_eps)
         if wait_check_eps:
@@ -2641,6 +2712,8 @@ class LocalMetadataCleaner(_PluginBase):
                 extra_parts.append(f"其中 {len(metadata_wait_eps)} 集已由剧/季目录刮削覆盖，先等待10分钟检查，仍缺图再触发单集刮削")
             if shared_trigger_eps:
                 extra_parts.append(f"其中 {len(shared_trigger_eps)} 集本批次已触发过同一真实文件刮削，不重复发送，只等待10分钟检查")
+            if recent_skip_eps:
+                extra_parts.append(f"其中 {len(recent_skip_eps)} 集最近已触发过单集刮削，已合并等待原10分钟检查，不重复发送")
             if target_missing_eps:
                 extra_parts.append(f"{len(target_missing_eps)} 集暂未找到真实媒体文件，后续单集任务会再次尝试并记录失败原因")
             extra = "；" + "；".join(extra_parts) if extra_parts else ""
@@ -2805,15 +2878,18 @@ class LocalMetadataCleaner(_PluginBase):
             "note": str(task.get("reason") or "")
         }
         if ok and show_root and str(show_root):
+            postcheck_batch_id = str(task.get("postcheck_batch_id") or "")
+            postcheck_due_ts = time.time() + max(self._post_scrape_check_delay_minutes, 0) * 60
             self._ensure_tv_postcheck_task(
                 state,
                 show_root,
                 mode="episodes",
                 episodes=[episode_strm],
                 reason="after_episode_scrape_success",
-                batch_id=str(task.get("postcheck_batch_id") or ""),
-                due_ts=time.time() + max(self._post_scrape_check_delay_minutes, 0) * 60,
+                batch_id=postcheck_batch_id,
+                due_ts=postcheck_due_ts,
             )
+            self._remember_episode_scrape_success(state, episode_strm, show_root, target_path, postcheck_batch_id, postcheck_due_ts)
             result["postcheck_msg"] = "单集刮削事件已发送成功，已从当前时间开始计时 10 分钟后检查图片。"
         if not ok:
             delays = self._tv_cd2_retry_delays()
@@ -3051,19 +3127,25 @@ class LocalMetadataCleaner(_PluginBase):
                 return {"remove": False, **result}
             if str(task.get("on_missing") or "") == "episode_scrape":
                 next_batch_id = self._make_task_batch_id("postdir")
+                scheduled_count = 0
+                skipped_recent_count = 0
                 for ep in missing:
-                    self._ensure_episode_scrape_task(
+                    if self._ensure_episode_scrape_task(
                         state,
                         ep,
                         show_root,
                         reason="metadata_directory_scrape_still_missing_image",
                         deleted_nfo=0,
                         postcheck_batch_id=next_batch_id,
-                    )
+                    ):
+                        scheduled_count += 1
+                    else:
+                        skipped_recent_count += 1
+                recent_note = f" 其中 {skipped_recent_count} 集最近已触发过刮削，已合并等待原10分钟检查，不重复发送。" if skipped_recent_count else ""
                 result = {
                     "time": self._now_iso(), "action": "tv_postcheck_missing_schedule_episode_scrape", "scope": str(show_root),
                     "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
-                    "scrape_msg": f"目录刮削后检查了 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片，已创建单集刮削任务，实际刮削前会删除 CD2 同名 nfo；不会直接加入 10 天复查。" + (f" 旧复查预览中有 {cleaned_count} 集当前已恢复，原任务仍保留到期。" if cleaned_count else ""),
+                    "scrape_msg": f"目录刮削后检查了 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片，已创建 {scheduled_count} 个单集刮削任务，实际刮削前会删除 CD2 同名 nfo；不会直接加入 10 天复查。" + recent_note + (f" 旧复查预览中有 {cleaned_count} 集当前已恢复，原任务仍保留到期。" if cleaned_count else ""),
                     "missing_count": len(missing), "deleted_nfo": 0, "note": names,
                     **self._episode_history_payload(show_root, checked_episodes, prefix="checked"),
                     **self._episode_history_payload(show_root, missing, prefix="missing"),
@@ -3088,10 +3170,15 @@ class LocalMetadataCleaner(_PluginBase):
                 self._append_history(state, result)
                 return {"remove": True, **result}
             scheduled_missing = self._unique_episode_paths(recheck.get("episodes") or missing)
+            duplicate_only = bool(recheck.get("duplicate_only"))
             result = {
-                "time": self._now_iso(), "action": "tv_postcheck_missing_schedule_recheck", "scope": str(show_root),
+                "time": self._now_iso(), "action": "tv_postcheck_duplicate_recheck_merged" if duplicate_only else "tv_postcheck_missing_schedule_recheck", "scope": str(show_root),
                 "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
-                "scrape_msg": f"刮削后检查了 {checked_count} 集，仍有 {len(scheduled_missing)} 集缺少对应图片，已加入 {self._tv_recheck_days:g} 天复查队列。" + (f" 旧复查预览中另有 {cleaned_count} 集当前已恢复，将保留到期后给出复查结果。" if cleaned_count else ""),
+                "scrape_msg": (
+                    f"刮削后检查了 {checked_count} 集，仍有 {len(scheduled_missing)} 集缺少对应图片；已合并到现有 {self._tv_recheck_days:g} 天复查任务，不重复通知。"
+                    if duplicate_only else
+                    f"刮削后检查了 {checked_count} 集，仍有 {len(scheduled_missing)} 集缺少对应图片，已加入 {self._tv_recheck_days:g} 天复查队列。"
+                ) + (f" 旧复查预览中另有 {cleaned_count} 集当前已恢复，将保留到期后给出复查结果。" if cleaned_count else ""),
                 "missing_count": len(scheduled_missing), "note": "、".join([self._episode_label(ep, show_root) for ep in scheduled_missing[:8]]),
                 "recheck_days": self._to_float(recheck.get("recheck_days"), self._tv_recheck_days),
                 **self._episode_history_payload(show_root, checked_episodes, prefix="checked"),
@@ -3351,6 +3438,23 @@ class LocalMetadataCleaner(_PluginBase):
             existing["last_msg"] = f"重复单集刮削任务已合并，等待：{existing['due_at']}；刮削成功后再计时 10 分钟检查。"
             self._schedule_delayed_check_until(self._to_float(existing.get("due_ts"), due_ts))
             return True
+        recent = self._recent_episode_scrape_entry(state, episode_strm)
+        if recent:
+            recent_batch_id = str(recent.get("postcheck_batch_id") or postcheck_batch_id or self._make_task_batch_id("recent"))
+            recent_due_ts = self._to_float(recent.get("postcheck_due_ts"), 0)
+            if recent_due_ts <= time.time():
+                recent_due_ts = time.time() + max(self._post_scrape_check_delay_minutes, 0) * 60
+            self._ensure_tv_postcheck_task(
+                state,
+                show_root,
+                mode="episodes",
+                episodes=[episode_strm],
+                reason="recent_episode_scrape_merged",
+                batch_id=recent_batch_id,
+                due_ts=recent_due_ts,
+            )
+            logger.info(f"监控strm刮削网盘：跳过近期已触发的重复单集刮削：{episode_strm}，合并等待检查：{self._ts_to_str(recent_due_ts)}")
+            return False
         queue[key] = {
             "task_type": "episode_scrape",
             "key": key,
@@ -3484,12 +3588,11 @@ class LocalMetadataCleaner(_PluginBase):
         self._schedule_delayed_check_until(due_ts)
 
     def _ensure_tv_recheck_task(self, state: Dict[str, Any], show_root: Path, episodes: List[Path] = None, reason: str = "", batch_id: str = "") -> Dict[str, Any]:
-        """只把确认仍缺图的单集加入复查，并返回实际入队结果。"""
+        """只把确认仍缺图的单集加入复查，并跨批次合并同一剧的复查任务。"""
         queue = state.setdefault("queue", {})
         batch_id = str(batch_id or "").strip()
-        key = f"tv_recheck::{show_root}::{batch_id}" if batch_id else f"tv_recheck::{show_root}"
+        preferred_key = f"tv_recheck::{show_root}::{batch_id}" if batch_id else f"tv_recheck::{show_root}"
         due_ts = time.time() + self._tv_recheck_days * 86400
-        existing = queue.get(key)
 
         # 再次过滤，避免已经生成图片的集数被加入 10 天复查。
         episode_strings = []
@@ -3499,34 +3602,84 @@ class LocalMetadataCleaner(_PluginBase):
                 if text not in episode_strings:
                     episode_strings.append(text)
         if not episode_strings:
-            return {"scheduled": False, "created": False, "key": key, "episodes": [], "due_ts": 0, "recheck_days": self._tv_recheck_days}
+            return {"scheduled": False, "created": False, "key": preferred_key, "episodes": [], "due_ts": 0, "recheck_days": self._tv_recheck_days}
 
-        if isinstance(existing, dict):
-            old_due = self._to_float(existing.get("due_ts"), 0)
-            # 同一批 10 天复查以首次确认缺图时间为准，不因重复检查反复后延。
-            if old_due:
-                due_ts = old_due
-            existing["due_ts"] = due_ts
-            existing["due_at"] = self._ts_to_str(due_ts)
-            old_eps = self._to_list(existing.get("episodes") or [])
-            merged = old_eps[:]
+        show_text = str(show_root)
+        candidate_keys: List[str] = []
+        if preferred_key in queue and isinstance(queue.get(preferred_key), dict):
+            candidate_keys.append(preferred_key)
+        for candidate_key, candidate_task in list(queue.items()):
+            if candidate_key in candidate_keys:
+                continue
+            if not isinstance(candidate_task, dict):
+                continue
+            if str(candidate_task.get("task_type") or "") != "tv_recheck":
+                continue
+            if str(candidate_task.get("show_root") or "") == show_text:
+                candidate_keys.append(str(candidate_key))
+
+        if candidate_keys:
+            canonical_key = candidate_keys[0]
+            existing = queue.get(canonical_key)
+            old_due_values = [self._to_float(existing.get("due_ts"), 0)] if isinstance(existing, dict) else []
+            merged = self._to_list(existing.get("episodes") or []) if isinstance(existing, dict) else []
+            # 计算“本次新增是否完全重复”时，要把所有待合并的同剧旧任务都算作已有范围。
+            # 否则升级前已经分裂成多个 batch 的复查任务中，如果本次命中的是非 canonical
+            # 任务里的集数，仍可能被误判为新增范围并再次发送“已列入复查”通知。
+            old_episode_set = {str(x) for x in merged if str(x or "").strip()}
+            for duplicate_key in candidate_keys[1:]:
+                duplicate = queue.get(duplicate_key)
+                if not isinstance(duplicate, dict):
+                    continue
+                for ep in self._to_list(duplicate.get("episodes") or []):
+                    text = str(ep)
+                    if text:
+                        old_episode_set.add(text)
             for ep in episode_strings:
                 if ep not in merged:
                     merged.append(ep)
+
+            # 合并升级前或重复批次留下的同剧复查任务，避免到期后重复通知/重复补刮。
+            for duplicate_key in candidate_keys[1:]:
+                duplicate = queue.get(duplicate_key)
+                if not isinstance(duplicate, dict):
+                    continue
+                old_due_values.append(self._to_float(duplicate.get("due_ts"), 0))
+                for ep in self._to_list(duplicate.get("episodes") or []):
+                    text = str(ep)
+                    if text and text not in merged:
+                        merged.append(text)
+                queue.pop(duplicate_key, None)
+
+            old_due_values = [x for x in old_due_values if x > 0]
+            if old_due_values:
+                due_ts = min(old_due_values)
+            existing["due_ts"] = due_ts
+            existing["due_at"] = self._ts_to_str(due_ts)
             existing["episodes"] = merged
             existing["duplicate_count"] = int(existing.get("duplicate_count") or 0) + 1
             existing["reason"] = reason or existing.get("reason") or ""
             existing["recheck_days"] = self._tv_recheck_days_for_task(existing)
-            if batch_id:
+            if batch_id and not existing.get("batch_id"):
                 existing["batch_id"] = batch_id
-            self._sync_tv_recheck_tasks(state, show_root, task_keys=[key])
-            if key in queue:
-                queue[key]["last_msg"] = f"10天复查任务已合并，复查时间：{queue[key].get('due_at')}"
-            return {"scheduled": True, "created": False, "key": key, "episodes": episode_strings, "due_ts": due_ts, "recheck_days": existing.get("recheck_days")}
+            self._sync_tv_recheck_tasks(state, show_root, task_keys=[canonical_key])
+            if canonical_key in queue:
+                queue[canonical_key]["last_msg"] = f"10天复查任务已跨批次合并，复查时间：{queue[canonical_key].get('due_at')}"
+            new_episode_set = {str(x) for x in episode_strings if str(x or "").strip()}
+            duplicate_only = bool(new_episode_set and new_episode_set.issubset(old_episode_set))
+            return {
+                "scheduled": True,
+                "created": False,
+                "duplicate_only": duplicate_only,
+                "key": canonical_key,
+                "episodes": episode_strings,
+                "due_ts": due_ts,
+                "recheck_days": existing.get("recheck_days"),
+            }
 
-        queue[key] = {
+        queue[preferred_key] = {
             "task_type": "tv_recheck",
-            "key": key,
+            "key": preferred_key,
             "show_root": str(show_root),
             "episodes": episode_strings,
             "batch_id": batch_id,
@@ -3541,7 +3694,7 @@ class LocalMetadataCleaner(_PluginBase):
             "missing_preview": self._preview_from_episodes(show_root, episode_strings, limit=8),
             "last_msg": f"10 分钟检查后仍缺图，等待 {self._tv_recheck_days:g} 天后复查"
         }
-        return {"scheduled": True, "created": True, "key": key, "episodes": episode_strings, "due_ts": due_ts, "recheck_days": self._tv_recheck_days}
+        return {"scheduled": True, "created": True, "duplicate_only": False, "key": preferred_key, "episodes": episode_strings, "due_ts": due_ts, "recheck_days": self._tv_recheck_days}
 
     def _schedule_delayed_check(self, delay_seconds: float):
         """按相对秒数安排一次短期队列检查。"""
@@ -4027,6 +4180,117 @@ class LocalMetadataCleaner(_PluginBase):
         except Exception as err:
             logger.warning(f"监控strm刮削网盘：检查剧集单集图片失败：{show_root} - {err}")
         return sorted(missing, key=lambda p: str(p))
+
+    def _initial_tv_scope_cooldown_seconds(self) -> float:
+        return max(float(self.DEFAULT_INITIAL_TV_SCOPE_COOLDOWN_SECONDS), float(self._initial_check_delay_seconds or 0) + 60)
+
+    def _episode_scrape_cooldown_seconds(self) -> float:
+        return max(
+            float(self._post_scrape_check_delay_minutes or 0) * 60 + float(self.DEFAULT_EPISODE_SCRAPE_COOLDOWN_EXTRA_SECONDS),
+            float(self._episode_scrape_delay_seconds or 0) + 60,
+            300.0,
+        )
+
+    def _prune_recent_dedupe_state(self, state: Dict[str, Any], now_ts: float = None) -> int:
+        now_ts = self._to_float(now_ts, time.time())
+        removed = 0
+
+        recent_initial = state.setdefault("recent_initial_tv_scopes", {})
+        if isinstance(recent_initial, dict):
+            ttl = max(self._initial_tv_scope_cooldown_seconds() * 4, 1800)
+            for key, value in list(recent_initial.items()):
+                ts = self._to_float(value.get("ts"), 0) if isinstance(value, dict) else 0
+                if not ts or ts > now_ts + 300 or now_ts - ts > ttl:
+                    recent_initial.pop(key, None)
+                    removed += 1
+        else:
+            state["recent_initial_tv_scopes"] = {}
+
+        recent_scrapes = state.setdefault("recent_episode_scrapes", {})
+        if isinstance(recent_scrapes, dict):
+            ttl = max(self._episode_scrape_cooldown_seconds() * 2, 1800)
+            for key, value in list(recent_scrapes.items()):
+                ts = self._to_float(value.get("ts"), 0) if isinstance(value, dict) else 0
+                if not ts or ts > now_ts + 300 or now_ts - ts > ttl:
+                    recent_scrapes.pop(key, None)
+                    removed += 1
+        else:
+            state["recent_episode_scrapes"] = {}
+        return removed
+
+    def _is_recent_initial_tv_duplicate(self, state: Dict[str, Any], task_key: str, info: Dict[str, Any], now_ts: float = None) -> bool:
+        now_ts = self._to_float(now_ts, time.time())
+        self._prune_recent_dedupe_state(state, now_ts=now_ts)
+        recent = state.setdefault("recent_initial_tv_scopes", {})
+        entry = recent.get(str(task_key)) if isinstance(recent, dict) else None
+        if not isinstance(entry, dict):
+            return False
+        ts = self._to_float(entry.get("ts"), 0)
+        if not ts or now_ts - ts < 0 or now_ts - ts > self._initial_tv_scope_cooldown_seconds():
+            return False
+        incoming_episode = str(info.get("episode_strm") or "").strip()
+        known_episodes = {str(x) for x in self._to_list(entry.get("episodes") or []) if str(x or "").strip()}
+        # 目录级事件没有单集信息，或该单集已被上一轮扫描覆盖时，视为重复。
+        if not incoming_episode or incoming_episode in known_episodes:
+            entry["duplicate_count"] = int(entry.get("duplicate_count") or 0) + 1
+            entry["last_duplicate_at"] = self._now_iso()
+            return True
+        return False
+
+    def _remember_initial_tv_scope(self, state: Dict[str, Any], task: Dict[str, Any], episode_paths: List[Path], scan_scope_type: str = "", scan_scope_path: Path = None):
+        task_key = str(task.get("key") or "").strip()
+        if not task_key:
+            return
+        recent = state.setdefault("recent_initial_tv_scopes", {})
+        if not isinstance(recent, dict):
+            recent = {}
+            state["recent_initial_tv_scopes"] = recent
+        now_ts = time.time()
+        recent[task_key] = {
+            "ts": now_ts,
+            "time": self._now_iso(),
+            "show_root": str(task.get("show_root") or ""),
+            "season_scope": str(task.get("season_scope") or ""),
+            "scan_scope_type": str(scan_scope_type or ""),
+            "scan_scope_path": str(scan_scope_path or ""),
+            "episodes": [str(x) for x in self._unique_episode_paths(episode_paths or [])],
+        }
+        self._prune_recent_dedupe_state(state, now_ts=now_ts)
+
+    def _recent_episode_scrape_entry(self, state: Dict[str, Any], episode_strm: Path) -> Optional[Dict[str, Any]]:
+        now_ts = time.time()
+        self._prune_recent_dedupe_state(state, now_ts=now_ts)
+        recent = state.setdefault("recent_episode_scrapes", {})
+        if not isinstance(recent, dict):
+            return None
+        key = self._normalise_path_text(str(episode_strm))
+        entry = recent.get(key)
+        if not isinstance(entry, dict):
+            return None
+        ts = self._to_float(entry.get("ts"), 0)
+        if not ts or now_ts - ts < 0 or now_ts - ts > self._episode_scrape_cooldown_seconds():
+            return None
+        entry["duplicate_count"] = int(entry.get("duplicate_count") or 0) + 1
+        entry["last_duplicate_at"] = self._now_iso()
+        return entry
+
+    def _remember_episode_scrape_success(self, state: Dict[str, Any], episode_strm: Path, show_root: Path, target_path: Path, postcheck_batch_id: str = "", postcheck_due_ts: float = 0):
+        recent = state.setdefault("recent_episode_scrapes", {})
+        if not isinstance(recent, dict):
+            recent = {}
+            state["recent_episode_scrapes"] = recent
+        key = self._normalise_path_text(str(episode_strm))
+        now_ts = time.time()
+        recent[key] = {
+            "ts": now_ts,
+            "time": self._now_iso(),
+            "episode_strm": str(episode_strm),
+            "show_root": str(show_root),
+            "target": str(target_path),
+            "postcheck_batch_id": str(postcheck_batch_id or ""),
+            "postcheck_due_ts": self._to_float(postcheck_due_ts, 0),
+        }
+        self._prune_recent_dedupe_state(state, now_ts=now_ts)
 
     def _sync_tv_recheck_tasks(self, state: Dict[str, Any], show_root: Path, task_keys: List[str] = None) -> int:
         """只刷新指定剧复查任务的展示预览。
@@ -5336,7 +5600,8 @@ class LocalMetadataCleaner(_PluginBase):
         """
         markers = state.get("markers")
         if not isinstance(markers, dict):
-            return
+            markers = {}
+            state["markers"] = markers
         candidates = []
         for key in ("show_root", "check_dir", "raw_path", "strm_path", "episode_strm", "scope_dir"):
             value = str(task.get(key) or "").strip()
@@ -5359,6 +5624,16 @@ class LocalMetadataCleaner(_PluginBase):
             seen.add(value)
             markers.pop(f"tv_root_whole_scrape::{value}", None)
             markers.pop(f"tv_season_scrape::{value}", None)
+        recent_initial = state.get("recent_initial_tv_scopes")
+        if isinstance(recent_initial, dict):
+            task_key = str(task.get("key") or "")
+            if task_key:
+                recent_initial.pop(task_key, None)
+        recent_scrapes = state.get("recent_episode_scrapes")
+        if isinstance(recent_scrapes, dict):
+            episode = str(task.get("episode_strm") or "")
+            if episode:
+                recent_scrapes.pop(self._normalise_path_text(episode), None)
 
     def _prune_stale_markers(self, state: Dict[str, Any], now_ts: float = None) -> int:
         """清理超过一小时的本插件目录刮削去重标记，限制持久状态增长。"""
@@ -5386,12 +5661,18 @@ class LocalMetadataCleaner(_PluginBase):
         data.setdefault("queue", {})
         data.setdefault("history", [])
         data.setdefault("markers", {})
+        data.setdefault("recent_initial_tv_scopes", {})
+        data.setdefault("recent_episode_scrapes", {})
         if not isinstance(data.get("queue"), dict):
             data["queue"] = {}
         if not isinstance(data.get("history"), list):
             data["history"] = []
         if not isinstance(data.get("markers"), dict):
             data["markers"] = {}
+        if not isinstance(data.get("recent_initial_tv_scopes"), dict):
+            data["recent_initial_tv_scopes"] = {}
+        if not isinstance(data.get("recent_episode_scrapes"), dict):
+            data["recent_episode_scrapes"] = {}
         return data
 
     def _append_history(self, state: Dict[str, Any], result: Dict[str, Any]):
@@ -5769,6 +6050,19 @@ class LocalMetadataCleaner(_PluginBase):
             return None
         action = str(result.get("action") or "")
         scrape = result.get("scrape")
+        # 中间态/创建任务类记录只留在插件详情页，不发站内通知：
+        # - 加入 10 天复查队列；
+        # - 10 天复查后创建补刮削任务；
+        # - 目录检查后创建单集补刮削任务；
+        # - 重复复查合并。
+        silent_actions = {
+            "tv_postcheck_missing_schedule_recheck",
+            "tv_postcheck_duplicate_recheck_merged",
+            "tv_recheck_missing_episodes_schedule_scrape",
+            "tv_postcheck_missing_schedule_episode_scrape",
+        }
+        if action in silent_actions:
+            return None
         confirmed_success_actions = {
             "tv_root_postcheck_complete",
             "tv_season_postcheck_complete",
@@ -5788,14 +6082,10 @@ class LocalMetadataCleaner(_PluginBase):
             kind = "failure"
         elif action in confirmed_success_actions:
             kind = "success"
-        elif action == "tv_postcheck_missing_schedule_recheck":
-            kind = "recheck_scheduled"
         elif action == "tv_recheck_complete":
             kind = "recheck_complete"
         elif action == "tv_recheck_stale_complete":
             kind = "recheck_skipped"
-        elif action == "tv_recheck_missing_episodes_schedule_scrape":
-            kind = "recheck_missing"
         else:
             return None
 
@@ -5994,33 +6284,49 @@ class LocalMetadataCleaner(_PluginBase):
                 label = self._notification_category_label(category)
                 if label and label not in range_labels:
                     range_labels.append(label)
-            title = "〖刮削完成〗" if len(range_labels) > 1 or int(entry.get("merged_count") or 1) > 1 else "〖刮削成功〗"
-            lines = [f"{media_label}：{media_name}"]
-            if range_labels:
-                lines.append(f"范围：{' / '.join(range_labels)}")
-            if episode_text:
-                lines.append(f"集数：{episode_text}")
-            elif entry.get("scope_label"):
-                lines.append(f"范围：{entry.get('scope_label')}")
-            if int(entry.get("merged_count") or 1) > 1:
-                lines.append(f"通知：已合并 {int(entry.get('merged_count') or 1)} 条处理记录")
+            merged_count = int(entry.get("merged_count") or 1)
+            is_episode_only = bool(episode_text) and (not range_labels or range_labels == ["单集图片"])
+            if media_type == "movie":
+                movie_scope = " / ".join([x for x in range_labels if x and x != "电影"]) or "电影元数据"
+                title = "✅【电影刮削成功】"
+                lines = [
+                    f"🎬 电影：{media_name}",
+                    f"🖼️ 处理范围：{movie_scope}",
+                    "",
+                    "结果：刮削信息已完成",
+                    "详情：点击进入插件页面",
+                ]
+            elif is_episode_only:
+                title = "✅【批量图片刮削成功】" if episode_total > 1 else "✅【单集图片刮削成功】"
+                lines = [
+                    f"📺 电视剧：{media_name}",
+                    f"🎞️ 完成集数：{episode_text}",
+                    "🖼️ 处理范围：单集图片",
+                    "",
+                    "结果：图片已生成，任务已完成",
+                    "详情：点击进入插件页面",
+                ]
+            else:
+                title = "✅【刮削完成】"
+                scope_text = " / ".join(range_labels) if range_labels else (str(entry.get("scope_label") or "") or "刮削信息")
+                lines = [
+                    f"📺 {media_label}：{media_name}",
+                    f"📦 完成范围：{scope_text}",
+                ]
+                if episode_text:
+                    lines.append(f"🎞️ 完成集数：{episode_text}")
+                lines.extend([
+                    "",
+                    "结果：刮削检查已通过",
+                    "详情：点击进入插件页面",
+                ])
+            if merged_count > 1:
+                lines.insert(-2, f"合并：已合并 {merged_count} 条处理记录")
             return title, "\n".join(lines)
-        if kind == "recheck_scheduled":
-            lines = [f"电视剧：{media_name}"]
-            if episode_text:
-                lines.append(f"缺图：{episode_text}")
-            lines.append(f"复查：{recheck_days}后")
-            return f"〖已列入{recheck_days}复查〗", "\n".join(lines)
         if kind == "recheck_complete":
             lines = [f"电视剧：{media_name}"]
             lines.append(f"已恢复：{episode_text}" if episode_text else "结果：缺图已恢复")
             return f"〖{recheck_days}复查完成〗", "\n".join(lines)
-        if kind == "recheck_missing":
-            lines = [f"电视剧：{media_name}"]
-            if episode_text:
-                lines.append(f"仍缺图：{episode_text}")
-            lines.append("处理：已创建补刮削任务")
-            return f"〖{recheck_days}复查仍缺图〗", "\n".join(lines)
         if kind == "recheck_skipped":
             lines = [f"电视剧：{media_name}"]
             if episode_text:
@@ -6055,7 +6361,7 @@ class LocalMetadataCleaner(_PluginBase):
         count = max(int(total or 0), len(values))
         if len(values) <= limit and count <= len(values):
             return preview
-        return f"{preview} 等，共{count}集"
+        return f"{preview} 等，共 {count} 集"
 
     def _queue_title(self, key: str, item: Dict[str, Any]) -> str:
         task_type = str(item.get("task_type") or "")
