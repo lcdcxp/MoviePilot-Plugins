@@ -48,7 +48,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "2.8.1"
+    plugin_version = "2.8.3"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -122,6 +122,7 @@ class LocalMetadataCleaner(_PluginBase):
         "tv_episode_missing_image_schedule_scrape": "单集缺图",
         "tv_episode_image_exists_skip_initial": "单集完整跳过",
         "tv_postcheck_missing_schedule_recheck": "刮削后缺图",
+        "tv_postcheck_duplicate_recheck_merged": "复查任务已合并",
         "tv_postcheck_missing_schedule_episode_scrape": "目录刮削后补单集",
         "tv_postcheck_complete": "刮削后完整",
         "tv_postcheck_show_missing": "刮削后检查失败",
@@ -587,13 +588,14 @@ class LocalMetadataCleaner(_PluginBase):
         display_items: List[Dict[str, Any]] = []
         seen_display = set()
         for source in (history_display or [], failure_display or []):
-            if not isinstance(source, dict):
-                continue
-            key = self._history_display_identity(source)
-            if key in seen_display:
-                continue
-            seen_display.add(key)
-            display_items.append(source)
+            for item in source:
+                if not isinstance(item, dict):
+                    continue
+                key = self._history_display_identity(item)
+                if key in seen_display:
+                    continue
+                seen_display.add(key)
+                display_items.append(item)
         panels: List[Dict[str, Any]] = []
         if display_items:
             history_groups = self._history_display_groups(display_items)
@@ -1436,6 +1438,8 @@ class LocalMetadataCleaner(_PluginBase):
             return "记录", "info"
         scrape = item.get("scrape")
         action = str(item.get("action") or "").lower()
+        if action in {"movie_metadata_incomplete_scrape", "movie_retry_scrape_success"} and scrape is True:
+            return "刮削成功", "success"
         if scrape is True:
             return "已触发刮削", "info"
         if scrape is False:
@@ -1467,6 +1471,14 @@ class LocalMetadataCleaner(_PluginBase):
 
     @staticmethod
     def _history_for_display(history: List[Dict[str, Any]], limit: int = 12) -> List[Dict[str, Any]]:
+        def episode_identity(item: Dict[str, Any]) -> str:
+            for prefix in ("missing", "checked", "scraped"):
+                for field in (f"{prefix}_episode_labels", f"{prefix}_episodes"):
+                    values = item.get(field) or []
+                    if isinstance(values, list) and values:
+                        return ",".join([str(x) for x in values[:20]])
+            return ""
+
         result: List[Dict[str, Any]] = []
         seen = set()
         for item in reversed(history or []):
@@ -1474,6 +1486,7 @@ class LocalMetadataCleaner(_PluginBase):
                 str(item.get("action") or ""),
                 str(item.get("scope") or ""),
                 str(item.get("folder") or ""),
+                episode_identity(item),
             )
             if key in seen:
                 continue
@@ -1489,10 +1502,12 @@ class LocalMetadataCleaner(_PluginBase):
         for item in reversed(history or []):
             if not isinstance(item, dict) or not self._is_history_failure(item):
                 continue
+            labels, _total = self._history_item_episode_summary(item)
             key = (
                 str(item.get("action") or ""),
                 str(item.get("scope") or ""),
                 str(item.get("folder") or ""),
+                ",".join([str(x) for x in labels[:20]]),
             )
             if key in seen:
                 continue
@@ -1604,7 +1619,17 @@ class LocalMetadataCleaner(_PluginBase):
         if info.get("media_type") == "tv":
             show_root_path = Path(str(info.get("show_root") or ""))
             episode_path = Path(str(info.get("episode_strm") or raw_path))
-            season_scope = str(self._tv_episode_season_scope(show_root_path, episode_path))
+            episode_text = self._normalise_path_text(str(episode_path))
+            show_text = self._normalise_path_text(str(show_root_path))
+            if (
+                episode_text
+                and Path(episode_text).suffix.lower() != ".strm"
+                and self._path_same_or_under(episode_text, show_text)
+            ):
+                # 目录级入库事件（整剧/Season）按目录本身隔离，避免 Season 目录被误合并成整剧任务键。
+                season_scope = episode_text
+            else:
+                season_scope = str(self._tv_episode_season_scope(show_root_path, episode_path))
             task_key = f"initial_tv::{info.get('show_root')}::{season_scope}"
         else:
             task_key = f"initial::{raw_path}"
@@ -2653,6 +2678,7 @@ class LocalMetadataCleaner(_PluginBase):
         recent_skip_eps: List[Path] = []
         metadata_wait_eps: List[Path] = []
         target_missing_eps: List[Path] = []
+        invalid_skip_eps: List[Path] = []
         metadata_wait_set = {str(x) for x in self._unique_episode_paths(metadata_scrape_episodes)}
         for episode_strm in missing_eps:
             if str(episode_strm) in metadata_wait_set:
@@ -2675,7 +2701,7 @@ class LocalMetadataCleaner(_PluginBase):
                 continue
             if not target:
                 target_missing_eps.append(episode_strm)
-            created = self._ensure_episode_scrape_task(
+            scrape_task_status = self._ensure_episode_scrape_task(
                 state,
                 episode_strm,
                 show_root,
@@ -2685,10 +2711,12 @@ class LocalMetadataCleaner(_PluginBase):
                 scrape_target=target,
                 refresh_batch=refresh_batch,
             )
-            if created:
+            if scrape_task_status in {"created", "merged"}:
                 scheduled_eps.append(episode_strm)
-            else:
+            elif scrape_task_status == "skipped_recent":
                 recent_skip_eps.append(episode_strm)
+            else:
+                invalid_skip_eps.append(episode_strm)
 
         wait_check_eps = self._unique_episode_paths(metadata_wait_eps + shared_trigger_eps)
         if wait_check_eps:
@@ -2714,6 +2742,8 @@ class LocalMetadataCleaner(_PluginBase):
                 extra_parts.append(f"其中 {len(shared_trigger_eps)} 集本批次已触发过同一真实文件刮削，不重复发送，只等待10分钟检查")
             if recent_skip_eps:
                 extra_parts.append(f"其中 {len(recent_skip_eps)} 集最近已触发过单集刮削，已合并等待原10分钟检查，不重复发送")
+            if invalid_skip_eps:
+                extra_parts.append(f"其中 {len(invalid_skip_eps)} 集 STRM 已不存在或越界，已跳过")
             if target_missing_eps:
                 extra_parts.append(f"{len(target_missing_eps)} 集暂未找到真实媒体文件，后续单集任务会再次尝试并记录失败原因")
             extra = "；" + "；".join(extra_parts) if extra_parts else ""
@@ -2875,7 +2905,8 @@ class LocalMetadataCleaner(_PluginBase):
         result = {
             "time": self._now_iso(), "action": "episode_delayed_scrape", "scope": str(episode_strm), "folder": str(target_path),
             "scrape": ok, "scrape_msg": msg, "deleted_nfo": total_deleted_nfo,
-            "note": str(task.get("reason") or "")
+            "note": str(task.get("reason") or ""),
+            "media_type": "tv",
         }
         if ok and show_root and str(show_root):
             postcheck_batch_id = str(task.get("postcheck_batch_id") or "")
@@ -2891,6 +2922,7 @@ class LocalMetadataCleaner(_PluginBase):
             )
             self._remember_episode_scrape_success(state, episode_strm, show_root, target_path, postcheck_batch_id, postcheck_due_ts)
             result["postcheck_msg"] = "单集刮削事件已发送成功，已从当前时间开始计时 10 分钟后检查图片。"
+            result.update(self._episode_history_payload(show_root, [episode_strm], prefix="scraped"))
         if not ok:
             delays = self._tv_cd2_retry_delays()
             has_next, due_ts, retry_count = self._advance_retry_task(task, delays, reason=msg)
@@ -3129,23 +3161,28 @@ class LocalMetadataCleaner(_PluginBase):
                 next_batch_id = self._make_task_batch_id("postdir")
                 scheduled_count = 0
                 skipped_recent_count = 0
+                skipped_invalid_count = 0
                 for ep in missing:
-                    if self._ensure_episode_scrape_task(
+                    scrape_task_status = self._ensure_episode_scrape_task(
                         state,
                         ep,
                         show_root,
                         reason="metadata_directory_scrape_still_missing_image",
                         deleted_nfo=0,
                         postcheck_batch_id=next_batch_id,
-                    ):
+                    )
+                    if scrape_task_status in {"created", "merged"}:
                         scheduled_count += 1
-                    else:
+                    elif scrape_task_status == "skipped_recent":
                         skipped_recent_count += 1
+                    else:
+                        skipped_invalid_count += 1
                 recent_note = f" 其中 {skipped_recent_count} 集最近已触发过刮削，已合并等待原10分钟检查，不重复发送。" if skipped_recent_count else ""
+                invalid_note = f" 其中 {skipped_invalid_count} 集 STRM 已不存在或越界，已跳过。" if skipped_invalid_count else ""
                 result = {
                     "time": self._now_iso(), "action": "tv_postcheck_missing_schedule_episode_scrape", "scope": str(show_root),
                     "folder": self._map_strm_path_to_scrape_path(str(show_root)), "scrape": None,
-                    "scrape_msg": f"目录刮削后检查了 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片，已创建 {scheduled_count} 个单集刮削任务，实际刮削前会删除 CD2 同名 nfo；不会直接加入 10 天复查。" + recent_note + (f" 旧复查预览中有 {cleaned_count} 集当前已恢复，原任务仍保留到期。" if cleaned_count else ""),
+                    "scrape_msg": f"目录刮削后检查了 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片，已创建 {scheduled_count} 个单集刮削任务，实际刮削前会删除 CD2 同名 nfo；不会直接加入 10 天复查。" + recent_note + invalid_note + (f" 旧复查预览中有 {cleaned_count} 集当前已恢复，原任务仍保留到期。" if cleaned_count else ""),
                     "missing_count": len(missing), "deleted_nfo": 0, "note": names,
                     **self._episode_history_payload(show_root, checked_episodes, prefix="checked"),
                     **self._episode_history_payload(show_root, missing, prefix="missing"),
@@ -3286,8 +3323,11 @@ class LocalMetadataCleaner(_PluginBase):
             self._append_history(state, result)
             return {"remove": True, **result}
         postcheck_batch_id = self._make_task_batch_id("recheck")
+        scheduled_count = 0
+        skipped_recent_count = 0
+        skipped_invalid_count = 0
         for episode in missing:
-            self._ensure_episode_scrape_task(
+            scrape_task_status = self._ensure_episode_scrape_task(
                 state,
                 episode,
                 show_root,
@@ -3295,9 +3335,17 @@ class LocalMetadataCleaner(_PluginBase):
                 deleted_nfo=0,
                 postcheck_batch_id=postcheck_batch_id,
             )
+            if scrape_task_status in {"created", "merged"}:
+                scheduled_count += 1
+            elif scrape_task_status == "skipped_recent":
+                skipped_recent_count += 1
+            else:
+                skipped_invalid_count += 1
+        recent_note = f"；其中 {skipped_recent_count} 集近期已触发过刮削，已合并等待原10分钟检查" if skipped_recent_count else ""
+        invalid_note = f"；其中 {skipped_invalid_count} 集 STRM 已不存在或越界，已跳过" if skipped_invalid_count else ""
         result = {
             "time": self._now_iso(), "action": "tv_recheck_missing_episodes_schedule_scrape", "scope": str(show_root), "folder": self._map_strm_path_to_scrape_path(str(show_root)),
-            "scrape": None, "scrape_msg": f"{recheck_days:g}天复查检查 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片，已创建单集刮削任务，实际刮削前会删除 CD2 同名 nfo，{self._episode_scrape_delay_seconds:g} 秒后逐集刮削。",
+            "scrape": None, "scrape_msg": f"{recheck_days:g}天复查检查 {checked_count} 集，仍有 {len(missing)} 集缺少对应图片，已创建 {scheduled_count} 个单集刮削任务，实际刮削前会删除 CD2 同名 nfo，{self._episode_scrape_delay_seconds:g} 秒后逐集刮削{recent_note}{invalid_note}。",
             "missing_count": len(missing), "deleted_nfo": 0,
             "note": "、".join([self._episode_label(ep, show_root) for ep in missing[:8]]) + (f"；已忽略 {stale_count} 个不存在的旧 STRM 路径" if stale_count else ""),
             **recheck_payload,
@@ -3404,11 +3452,11 @@ class LocalMetadataCleaner(_PluginBase):
         postcheck_batch_id: str = "",
         scrape_target: str = "",
         refresh_batch: set = None,
-    ):
+    ) -> str:
         queue = state.setdefault("queue", {})
         if not self._is_safe_strm_episode_file(episode_strm, show_root=show_root, require_exists=True):
             logger.info(f"监控strm刮削网盘：跳过已不存在或越界的 STRM 单集任务：{episode_strm}")
-            return False
+            return "invalid"
         key = f"episode::{episode_strm}"
         due_ts = time.time() + max(self._episode_scrape_delay_seconds, 0)
         target = ""
@@ -3437,7 +3485,7 @@ class LocalMetadataCleaner(_PluginBase):
                 existing["postcheck_batch_id"] = str(postcheck_batch_id)
             existing["last_msg"] = f"重复单集刮削任务已合并，等待：{existing['due_at']}；刮削成功后再计时 10 分钟检查。"
             self._schedule_delayed_check_until(self._to_float(existing.get("due_ts"), due_ts))
-            return True
+            return "merged"
         recent = self._recent_episode_scrape_entry(state, episode_strm)
         if recent:
             recent_batch_id = str(recent.get("postcheck_batch_id") or postcheck_batch_id or self._make_task_batch_id("recent"))
@@ -3454,7 +3502,7 @@ class LocalMetadataCleaner(_PluginBase):
                 due_ts=recent_due_ts,
             )
             logger.info(f"监控strm刮削网盘：跳过近期已触发的重复单集刮削：{episode_strm}，合并等待检查：{self._ts_to_str(recent_due_ts)}")
-            return False
+            return "skipped_recent"
         queue[key] = {
             "task_type": "episode_scrape",
             "key": key,
@@ -3474,7 +3522,7 @@ class LocalMetadataCleaner(_PluginBase):
             "last_msg": f"等待 {self._episode_scrape_delay_seconds:g} 秒后刮削单集；刮削成功后再计时 10 分钟检查"
         }
         self._schedule_delayed_check(max(self._episode_scrape_delay_seconds, 0))
-        return True
+        return "created"
 
     def _ensure_tv_postcheck_task(
         self,
@@ -4228,10 +4276,24 @@ class LocalMetadataCleaner(_PluginBase):
         ts = self._to_float(entry.get("ts"), 0)
         if not ts or now_ts - ts < 0 or now_ts - ts > self._initial_tv_scope_cooldown_seconds():
             return False
-        incoming_episode = str(info.get("episode_strm") or "").strip()
+        incoming_episode = self._normalise_path_text(str(info.get("episode_strm") or info.get("strm_path") or "").strip())
         known_episodes = {str(x) for x in self._to_list(entry.get("episodes") or []) if str(x or "").strip()}
-        # 目录级事件没有单集信息，或该单集已被上一轮扫描覆盖时，视为重复。
-        if not incoming_episode or incoming_episode in known_episodes:
+        incoming_is_episode = bool(incoming_episode and Path(incoming_episode).suffix.lower() == ".strm")
+        entry_scope = self._normalise_path_text(str(entry.get("scan_scope_path") or entry.get("season_scope") or entry.get("show_root") or ""))
+        # 目录级事件按已处理扫描范围判断；单集事件按上一轮已覆盖的 STRM 列表判断。
+        duplicate_scope = (
+            not incoming_episode
+            or (incoming_is_episode and incoming_episode in known_episodes)
+            or (
+                not incoming_is_episode
+                and entry_scope
+                and (
+                    self._path_same_or_under(incoming_episode, entry_scope)
+                    or self._path_same_or_under(entry_scope, incoming_episode)
+                )
+            )
+        )
+        if duplicate_scope:
             entry["duplicate_count"] = int(entry.get("duplicate_count") or 0) + 1
             entry["last_duplicate_at"] = self._now_iso()
             return True
@@ -5699,16 +5761,17 @@ class LocalMetadataCleaner(_PluginBase):
             history_age = now_ts - old_ts if old_ts else -1
             if old_ts and 0 <= history_age <= 600:
                 old["time"] = result.get("time") or old.get("time")
-                for field in [
-                    # 展示文字也要同步，否则同类记录 10 分钟内去重后，页面可能显示旧的“检查 X 集”。
-                    "scrape_msg", "postcheck_msg", "metadata",
-                    "checked_episodes", "checked_episode_labels", "checked_episode_total", "checked_episode_truncated",
-                    "missing_episodes", "missing_episode_labels", "missing_episode_total", "missing_episode_truncated",
-                    "scraped_episodes", "scraped_episode_labels", "scraped_episode_total", "scraped_episode_truncated",
-                    "missing_count", "existing_count", "deleted_nfo", "note",
-                ]:
+                # 展示文字同步为最新；集数类字段做并集合并，避免同剧不同集在 10 分钟内互相覆盖。
+                for field in ["scrape_msg", "postcheck_msg", "metadata"]:
                     if result.get(field) not in (None, "", [], {}):
                         old[field] = result.get(field)
+                for prefix in ("checked", "missing", "scraped"):
+                    self._merge_history_episode_payload(old, result, prefix)
+                for field in ["missing_count", "existing_count", "deleted_nfo"]:
+                    if result.get(field) not in (None, "", [], {}):
+                        old[field] = max(int(self._to_float(old.get(field), 0)), int(self._to_float(result.get(field), 0)))
+                if result.get("note") not in (None, "", [], {}):
+                    old["note"] = self._merge_history_note(old.get("note"), result.get("note"))
                 old["duplicate_count"] = int(old.get("duplicate_count") or 1) + 1
                 old["_dedupe_ts"] = now_ts
                 # 更新时间后的记录也应成为最新一条，保证概览和倒序历史一致。
@@ -5719,6 +5782,47 @@ class LocalMetadataCleaner(_PluginBase):
         result["_dedupe_ts"] = now_ts
         history.append(result)
         state["history"] = history[-self.HISTORY_LIMIT:]
+
+    def _merge_history_episode_payload(self, old: Dict[str, Any], result: Dict[str, Any], prefix: str, limit: int = 200):
+        path_field = f"{prefix}_episodes"
+        label_field = f"{prefix}_episode_labels"
+        total_field = f"{prefix}_episode_total"
+        truncated_field = f"{prefix}_episode_truncated"
+
+        for field in (path_field, label_field):
+            incoming = [str(x) for x in self._to_list(result.get(field) or []) if str(x or "").strip()]
+            if not incoming:
+                continue
+            merged = [str(x) for x in self._to_list(old.get(field) or []) if str(x or "").strip()]
+            for value in incoming:
+                if value not in merged:
+                    merged.append(value)
+            if len(merged) > limit:
+                old[field] = merged[:limit]
+                old[truncated_field] = True
+            else:
+                old[field] = merged
+
+        old_total = int(self._to_float(old.get(total_field), 0))
+        new_total = int(self._to_float(result.get(total_field), 0))
+        label_count = len(self._to_list(old.get(label_field) or []))
+        path_count = len(self._to_list(old.get(path_field) or []))
+        total = max(old_total, new_total, label_count, path_count)
+        if total:
+            old[total_field] = total
+        if result.get(truncated_field):
+            old[truncated_field] = True
+
+    @staticmethod
+    def _merge_history_note(old_note: Any, new_note: Any, max_len: int = 360) -> str:
+        old_text = str(old_note or "").strip()
+        new_text = str(new_note or "").strip()
+        if not old_text:
+            return new_text[:max_len]
+        if not new_text or new_text in old_text:
+            return old_text[:max_len]
+        merged = f"{old_text}；{new_text}"
+        return merged[:max_len]
 
     @staticmethod
     def _history_dedupe_key(result: Dict[str, Any]) -> str:
@@ -6064,6 +6168,8 @@ class LocalMetadataCleaner(_PluginBase):
         if action in silent_actions:
             return None
         confirmed_success_actions = {
+            "movie_metadata_incomplete_scrape",
+            "movie_retry_scrape_success",
             "tv_root_postcheck_complete",
             "tv_season_postcheck_complete",
             "tv_postcheck_complete",
