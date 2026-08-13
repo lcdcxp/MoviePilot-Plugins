@@ -44,9 +44,9 @@ class JuyingCheckin(_PluginBase):
     plugin_name = "聚影签到"
     plugin_desc = "用于聚影自动签到，支持账号密码、多账号、定时执行、代理、失败重试和签到历史。感谢大胖提供的支持。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/signin.png"
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     plugin_author = "jidian"
-    author_url = "https://share.huamucang.top"
+    author_url = "https://www.jying.top"
     plugin_config_prefix = "juyingcheckin_"
     plugin_order = 66
     auth_level = 1
@@ -55,7 +55,7 @@ class JuyingCheckin(_PluginBase):
     _notify: bool = True
     _onlyonce: bool = False
     _cron: str = "10 8 * * *"
-    _site_url: str = "https://share.huamucang.top"
+    _site_url: str = "https://www.jying.top"
     _login_api: str = "/api/app/login/"
     _checkin_api: str = "/api/app/checkin/do/"
     _username: str = ""
@@ -72,7 +72,11 @@ class JuyingCheckin(_PluginBase):
     _clear_history: bool = False
     _check_proxy: bool = False
     _scheduler: Optional[BackgroundScheduler] = None
-    _default_site_url: str = "https://share.huamucang.top"
+    _default_site_url: str = "https://www.jying.top"
+    _legacy_site_urls = {
+        "https://share.huamucang.top",
+        "https://share.huamucang.top/",
+    }
     _sensitive_keys = {
         "password",
         "passwd",
@@ -95,7 +99,11 @@ class JuyingCheckin(_PluginBase):
         self._notify = self.__safe_bool(config.get("notify", True))
         self._onlyonce = self.__safe_bool(config.get("onlyonce", False))
         self._cron = str(config.get("cron") or "10 8 * * *").strip()
-        self._site_url = self.__normalize_site_url(config.get("site_url"), default=self._default_site_url)
+        # 旧版保存过旧域名时自动迁移到聚影新域名，避免升级后仍然请求已停用的站点。
+        configured_site_url = str(config.get("site_url") or "").strip().rstrip("/")
+        if configured_site_url.lower() in {item.rstrip("/").lower() for item in self._legacy_site_urls}:
+            configured_site_url = self._default_site_url
+        self._site_url = self.__normalize_site_url(configured_site_url, default=self._default_site_url)
         self._login_api = self.__normalize_api_path(config.get("login_api"), default="/api/app/login/")
         self._checkin_api = self.__normalize_api_path(config.get("checkin_api"), default="/api/app/checkin/do/")
         self._username = str(config.get("username") or "").strip()
@@ -1187,7 +1195,7 @@ class JuyingCheckin(_PluginBase):
             "notify": True,
             "onlyonce": False,
             "cron": "10 8 * * *",
-            "site_url": "https://share.huamucang.top",
+            "site_url": "https://www.jying.top",
             "login_api": "/api/app/login/",
             "checkin_api": "/api/app/checkin/do/",
             "username": "",
@@ -1411,7 +1419,7 @@ class JuyingCheckin(_PluginBase):
                                 {
                                     "component": "VRow",
                                     "content": [
-                                        self.__col_text("site_url", "站点地址", "https://share.huamucang.top", 4, icon="mdi-web"),
+                                        self.__col_text("site_url", "站点地址", "https://www.jying.top", 4, icon="mdi-web"),
                                         self.__col_text("login_api", "登录接口", "/api/app/login/", 4, icon="mdi-login"),
                                         self.__col_text("checkin_api", "签到接口", "/api/app/checkin/do/", 4, icon="mdi-check-decagram"),
                                     ],
