@@ -48,7 +48,7 @@ class LocalMetadataCleaner(_PluginBase):
     plugin_name = "监控strm刮削网盘"
     plugin_desc = "复用 MP 全局媒体库入库事件：检查 STRM 库刮削信息，缺失时通过网盘真实路径触发 MP 刮削。"
     plugin_icon = "https://movie-pilot.org/assets/icon.png"
-    plugin_version = "2.9.1"
+    plugin_version = "2.9.2"
     plugin_author = "jidian"
     author_url = ""
     plugin_config_prefix = "localmetadatacleaner_"
@@ -581,7 +581,7 @@ class LocalMetadataCleaner(_PluginBase):
             content.append({"component": "VExpansionPanels", "props": {"variant": "accordion", "class": "mt-3"}, "content": panels})
         else:
             content.append(self._empty_state("mdi-check-circle-outline", "当前没有待处理任务。", "新增入库后，这里会按类型和剧名聚合显示任务摘要。", "success"))
-        return {"component": "VCard", "props": {"variant": "flat", "color": "surface", "class": "pa-4 mb-4 elevation-2", "style": self._section_card_style()}, "content": content}
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 mb-4 elevation-2", "style": self._section_card_style()}, "content": content}
 
     def _history_section(self, history_display: List[Dict[str, Any]], failure_display: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         failure_display = failure_display or []
@@ -612,14 +612,14 @@ class LocalMetadataCleaner(_PluginBase):
             content.append({"component": "VExpansionPanels", "props": {"variant": "accordion", "class": "mt-3"}, "content": panels})
         else:
             content.append(self._empty_state("mdi-history", "暂无最近处理记录。", "完成刮削、检查或复查后，这里会按媒体聚合展示历史。", "info"))
-        return {"component": "VCard", "props": {"variant": "flat", "color": "surface", "class": "pa-4 mb-4 elevation-2", "style": self._section_card_style()}, "content": content}
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-4 mb-4 elevation-2", "style": self._section_card_style()}, "content": content}
 
     @staticmethod
     def _workbench_section_header(number: str, title: str, subtitle: str = "", actions: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         is_history = "历史" in str(title) or "记录" in str(title)
         icon = "mdi-table-clock" if is_history else "mdi-playlist-check"
         color = "primary" if is_history else "info"
-        icon_color = "rgb(var(--v-theme-primary))" if is_history else "#16B1FF"
+        icon_color = "rgb(var(--v-theme-primary))" if is_history else "rgb(var(--v-theme-info))"
         return {"component": "div", "props": {"class": "mb-2"}, "content": [
             {"component": "div", "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-3"}, "content": [
                 {"component": "div", "props": {"class": "d-flex align-center ga-2"}, "content": [
@@ -1050,7 +1050,7 @@ class LocalMetadataCleaner(_PluginBase):
         if dup > 1:
             detail_lines.append(self._mini_line("重复合并", f"{dup} 次"))
 
-        return {"component": "VCard", "props": {"variant": "flat", "color": "surface", "class": "pa-3 rounded-lg", "elevation": 0, "style": self._detail_card_style(outcome_color)}, "content": [
+        return {"component": "VCard", "props": {"variant": "flat", "class": "pa-3 rounded-lg", "elevation": 0, "style": self._detail_card_style(outcome_color)}, "content": [
             {"component": "div", "props": {"class": "d-flex flex-wrap align-center justify-space-between ga-2"}, "content": [
                 {"component": "div", "content": [
                     {"component": "div", "props": {"class": "text-subtitle-1 font-weight-medium"}, "text": title},
@@ -1319,78 +1319,101 @@ class LocalMetadataCleaner(_PluginBase):
         return palette.get(key, key)
 
     def _tone_palette(self, color: str = "info") -> Dict[str, str]:
+        """色调全部基于 Vuetify 主题 CSS 变量生成。
+
+        不写死任何颜色值，浅色、深色、紫色、透明主题都会自动取当前主题的
+        info / success / warning / primary 色，避免深色主题下出现浅色文字压白底的问题。
+        """
         key = self._ui_color(color)
-        palettes = {
-            "info": {"soft": "#e7f7ff", "tint": "#e7f7ff", "border": "#b8e7ff", "text": "#16b1ff", "shadow": "rgba(22, 177, 255, 0.12)"},
-            "success": {"soft": "#eef9e5", "tint": "#eef9e5", "border": "#c9edb8", "text": "#43c431", "shadow": "rgba(67, 196, 49, 0.12)"},
-            "warning": {"soft": "#fff6e4", "tint": "#fff0d1", "border": "#ffdfa3", "text": "#ff9800", "shadow": "rgba(255, 152, 0, 0.12)"},
-            "primary": {"soft": "rgba(var(--v-theme-primary),0.12)", "tint": "rgba(var(--v-theme-primary),0.12)", "border": "rgba(var(--v-theme-primary),0.26)", "text": "rgb(var(--v-theme-primary))", "shadow": "rgba(var(--v-theme-primary),0.12)"},
+        if key not in ("info", "success", "warning", "primary"):
+            key = "info"
+        token = f"var(--v-theme-{key})"
+        return {
+            "soft": f"rgba({token},0.14)",
+            "tint": f"rgba({token},0.14)",
+            "border": f"rgba({token},0.32)",
+            "text": f"rgb({token})",
+            "shadow": f"rgba({token},0.12)",
         }
-        return palettes.get(key, palettes["info"])
+
+    # 详情页只使用 Vuetify 主题 CSS 变量取色：
+    # on-surface 在浅色主题是深色字、深色主题是浅色字，按透明度叠加后分隔线和表头底色都能自适应。
+    THEME_DIVIDER = "rgba(var(--v-theme-on-surface),0.12)"
+    THEME_DIVIDER_SOFT = "rgba(var(--v-theme-on-surface),0.08)"
+    THEME_TABLE_HEADER_BG = "rgba(var(--v-theme-on-surface),0.04)"
+    THEME_MUTED_TEXT = "rgba(var(--v-theme-on-surface),var(--v-medium-emphasis-opacity))"
 
     def _page_style(self) -> str:
-        if str(getattr(self, "DETAIL_COLOR_MODE", "color") or "color") == "plain":
-            return "background:#ffffff;border-radius:10px;"
-        return "background:#f7f7f9;border-radius:10px;color:#3f3b48;"
+        # 页面底色用主题 background 色半透明叠加：浅色主题是浅灰底衬白卡片，深色主题是更深的底衬深色卡片。
+        # 文字颜色不再写死，交给主题的 on-surface / on-background。
+        return "background:rgba(var(--v-theme-background),0.7);border-radius:12px;"
 
     def _section_card_style(self, color: str = "info") -> str:
-        return "background:#ffffff;border:0;box-shadow:0 2px 10px rgba(15,23,42,0.06);border-radius:16px;"
+        # 卡片背景交给 Vuetify 的 surface 色（不再指定 color=surface，避免 !important 工具类和内联样式打架），
+        # 这里只补一圈细边框，深色主题下也能分清层次。
+        return f"border:1px solid {self.THEME_DIVIDER_SOFT};border-radius:16px;"
 
     def _detail_card_style(self, color: str = "info") -> str:
         tone = self._tone_palette(color)
-        return f"background:#ffffff;border:1px solid {tone['border']};box-shadow:none;"
+        return f"border:1px solid {tone['border']};box-shadow:none;"
 
     def _empty_card_style(self, color: str = "info") -> str:
         tone = self._tone_palette(color)
-        return f"background:{tone['soft']};border:0;color:#4f4a57;"
+        return f"background:{tone['soft']};border:0;"
 
     def _inline_row_style(self, color: str = "info") -> str:
         tone = self._tone_palette(color)
-        return f"background:#ffffff;border:1px solid {tone['border']};"
+        return f"border:1px solid {tone['border']};"
 
-    @staticmethod
-    def _expansion_panel_style() -> str:
-        return "background:#ffffff;border:1px solid #e1e6ef;border-radius:6px;overflow:hidden;margin-bottom:8px;"
+    def _expansion_panel_style(self) -> str:
+        return f"border:1px solid {self.THEME_DIVIDER};border-radius:8px;overflow:hidden;margin-bottom:8px;"
 
-    @staticmethod
-    def _panel_header_style() -> str:
-        return "min-height:56px;padding:10px 16px;background:#ffffff;"
+    def _panel_header_style(self) -> str:
+        return "min-height:56px;padding:10px 16px;"
 
-    @staticmethod
-    def _queue_detail_body_style() -> str:
-        return "padding:12px 22px;background:#ffffff;border-top:1px solid #e1e6ef;"
+    def _queue_detail_body_style(self) -> str:
+        return f"padding:12px 22px;border-top:1px solid {self.THEME_DIVIDER};"
 
-    @staticmethod
-    def _queue_table_style() -> str:
-        return "border-top:1px solid #e1e6ef;background:#ffffff;"
+    def _queue_table_style(self) -> str:
+        return f"border-top:1px solid {self.THEME_DIVIDER};"
 
-    @staticmethod
-    def _queue_table_header_style() -> str:
-        return "display:grid;grid-template-columns:1.1fr 1.2fr 2.5fr 1.4fr 2.2fr 2.5fr;gap:8px;align-items:center;padding:12px 22px;background:#fbfcfe;border-bottom:1px solid #e1e6ef;color:#334155;font-size:13px;font-weight:500;"
+    def _queue_table_header_style(self) -> str:
+        return (
+            "display:grid;grid-template-columns:1.1fr 1.2fr 2.5fr 1.4fr 2.2fr 2.5fr;gap:8px;align-items:center;"
+            f"padding:12px 22px;background:{self.THEME_TABLE_HEADER_BG};border-bottom:1px solid {self.THEME_DIVIDER};"
+            f"color:{self.THEME_MUTED_TEXT};font-size:13px;font-weight:500;"
+        )
 
-    @staticmethod
-    def _queue_table_row_style() -> str:
-        return "display:grid;grid-template-columns:1.1fr 1.2fr 2.5fr 1.4fr 2.2fr 2.5fr;gap:8px;align-items:center;min-height:46px;padding:6px 22px;border-bottom:1px solid #e8ecf3;"
+    def _queue_table_row_style(self) -> str:
+        return (
+            "display:grid;grid-template-columns:1.1fr 1.2fr 2.5fr 1.4fr 2.2fr 2.5fr;gap:8px;align-items:center;"
+            f"min-height:46px;padding:6px 22px;border-bottom:1px solid {self.THEME_DIVIDER_SOFT};"
+        )
 
-    @staticmethod
-    def _table_footer_style() -> str:
-        return "display:flex;align-items:center;justify-content:center;min-height:42px;color:#334155;border-bottom:1px solid #e8ecf3;font-size:14px;"
+    def _table_footer_style(self) -> str:
+        return (
+            "display:flex;align-items:center;justify-content:center;min-height:42px;"
+            f"color:{self.THEME_MUTED_TEXT};border-bottom:1px solid {self.THEME_DIVIDER_SOFT};font-size:14px;"
+        )
 
-    @staticmethod
-    def _recheck_table_container_style() -> str:
-        return "border:1px solid #e1e6ef;border-radius:6px;overflow:hidden;margin-top:4px;background:#ffffff;"
+    def _recheck_table_container_style(self) -> str:
+        return f"border:1px solid {self.THEME_DIVIDER};border-radius:6px;overflow:hidden;margin-top:4px;"
 
-    @staticmethod
-    def _recheck_table_header_style() -> str:
-        return "display:grid;grid-template-columns:2.4fr 1.5fr 1.5fr 1.3fr;gap:8px;align-items:center;padding:9px 14px;background:#fbfcfe;border-bottom:1px solid #e1e6ef;color:#334155;font-size:12.5px;font-weight:500;"
+    def _recheck_table_header_style(self) -> str:
+        return (
+            "display:grid;grid-template-columns:2.4fr 1.5fr 1.5fr 1.3fr;gap:8px;align-items:center;"
+            f"padding:9px 14px;background:{self.THEME_TABLE_HEADER_BG};border-bottom:1px solid {self.THEME_DIVIDER};"
+            f"color:{self.THEME_MUTED_TEXT};font-size:12.5px;font-weight:500;"
+        )
 
-    @staticmethod
-    def _recheck_table_row_style() -> str:
-        return "display:grid;grid-template-columns:2.4fr 1.5fr 1.5fr 1.3fr;gap:8px;align-items:center;min-height:40px;padding:4px 14px;border-bottom:1px solid #e8ecf3;"
+    def _recheck_table_row_style(self) -> str:
+        return (
+            "display:grid;grid-template-columns:2.4fr 1.5fr 1.5fr 1.3fr;gap:8px;align-items:center;"
+            f"min-height:40px;padding:4px 14px;border-bottom:1px solid {self.THEME_DIVIDER_SOFT};"
+        )
 
-    @staticmethod
-    def _history_body_style() -> str:
-        return "padding:0 24px 12px 54px;background:#ffffff;"
+    def _history_body_style(self) -> str:
+        return "padding:0 24px 12px 54px;"
 
     def _chip_style(self, color: str = "info") -> str:
         tone = self._tone_palette(color)
