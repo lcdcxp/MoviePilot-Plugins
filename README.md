@@ -9,12 +9,13 @@
 | CD2Notify | CloudDrive2通知 | v1.2 | V2 | plugins.v2/cd2notify |
 | JuyingCheckin | 聚影签到 | v1.4 | V2 | plugins.v2/juyingcheckin |
 | LocalMetadataCleaner | 监控strm刮削网盘 | v2.9.2 | V2 | plugins.v2/localmetadatacleaner |
-| LibraryIntegrity | 媒体库缺集检查 | v1.0.14 | V3 | plugins.v3/libraryintegrity |
+| LibraryIntegrity | 媒体库缺集检查 | v1.0.15 | V3 | plugins.v3/libraryintegrity |
 
 ## LibraryIntegrity 说明
 
 上游来源：[jxxghp/MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins) 的 `plugins.v3/libraryintegrity`，原作者 Derrors，协议 GPL-3.0（见 `LICENSE`）。本仓库版本在上游 1.0.12 基础上修改：
 
+- **v1.0.15**：作者字段改为 `Derrors, lcdcxp`（保留原作者 + 追加维护者），`author_url` 指向本仓库。
 - **v1.0.14**：显示名称改为「媒体库缺集检查」。插件 ID `LibraryIntegrity`、目录 `libraryintegrity`、配置前缀 `libraryintegrity_` 全部保持不变，已装插件的配置不会丢。
 - **v1.0.13**：配置页的「Emby 媒体库名称」改为可选下拉。打开配置页时从已连接的 Emby 服务器读取影视库列表（自动剔除音乐、书籍、家庭视频等非影视库），可点选多个；读取失败时仍可手动输入后回车。
 

@@ -95,10 +95,10 @@ class LibraryIntegrity(_PluginBase):
     plugin_name = "媒体库缺集检查"
     plugin_desc = "检查剧集缺集、同季版本不一致与多文件，支持 Emby 与本地目录（含 strm、NFO、媒体信息），可选 AI 建议，只生成报告不改动文件。"
     plugin_icon = "Emby_A.png"
-    plugin_version = "1.0.14"
+    plugin_version = "1.0.15"
     plugin_label = "媒体库,Emby,检查,AI"
-    plugin_author = "Derrors"
-    author_url = "https://github.com/Derrors"
+    plugin_author = "Derrors, lcdcxp"
+    author_url = "https://github.com/lcdcxp"
     plugin_config_prefix = "libraryintegrity_"
     plugin_order = 60
     auth_level = 1
