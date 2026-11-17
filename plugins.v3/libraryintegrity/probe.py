@@ -143,7 +143,7 @@ class MediaProbe:
         except FileNotFoundError:
             return {}
         except (OSError, ValueError) as err:
-            logger.warning(f"影视库完整性检查：媒体信息缓存无法读取，已重建：{err}")
+            logger.warning(f"媒体库缺集检查：媒体信息缓存无法读取，已重建：{err}")
             return {}
 
     def _command(self, path: Path) -> list[str]:
@@ -183,7 +183,7 @@ class MediaProbe:
                 payload = json.loads(completed.stdout)
                 fields = parse_mediainfo(payload) if self._kind == "mediainfo" else parse_ffprobe(payload)
         except (OSError, subprocess.SubprocessError, ValueError) as err:
-            logger.debug(f"影视库完整性检查：读取媒体信息失败 {path}：{err}")
+            logger.debug(f"媒体库缺集检查：读取媒体信息失败 {path}：{err}")
         # 读取失败也记录，避免每轮重复尝试同一个损坏文件；文件变化后会重新读取
         self._cache[key] = {
             "size": stat.st_size,
@@ -207,4 +207,4 @@ class MediaProbe:
             tmp.replace(self._cache_file)
             self._dirty = False
         except OSError as err:
-            logger.warning(f"影视库完整性检查：媒体信息缓存保存失败：{err}")
+            logger.warning(f"媒体库缺集检查：媒体信息缓存保存失败：{err}")

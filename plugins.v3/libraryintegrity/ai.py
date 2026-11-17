@@ -265,7 +265,7 @@ class AiAnswerCache:
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as err:
-            logger.warning(f"影视库完整性检查：AI 结果缓存无法读取，已重建：{err}")
+            logger.warning(f"媒体库缺集检查：AI 结果缓存无法读取，已重建：{err}")
 
     def get(self, key: str) -> Optional[CachedAnswer]:
         """取出缓存的回答，并标记为本轮用到。"""
@@ -295,7 +295,7 @@ class AiAnswerCache:
             tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             tmp.replace(self.path)
         except OSError as err:
-            logger.warning(f"影视库完整性检查：AI 结果缓存保存失败：{err}")
+            logger.warning(f"媒体库缺集检查：AI 结果缓存保存失败：{err}")
 
 
 def _data(text: str) -> str:
@@ -376,7 +376,7 @@ def summary_prompt(counts: dict[str, int], samples: list[str]) -> str:
     """生成报告摘要提示。"""
     count_text = "、".join(f"{label} {count} 项" for label, count in counts.items())
     return (
-        f"影视库完整性检查结果：{count_text}。\n部分问题：\n{_data(chr(10).join(samples))}\n\n"
+        f"媒体库缺集检查结果：{count_text}。\n部分问题：\n{_data(chr(10).join(samples))}\n\n"
         "请用不超过 150 字的中文为用户总结：最值得优先处理的问题和建议的处理顺序。"
         "按处理顺序分条，每条单独一行并以「1.」这样的序号开头；每条的要点可以用 **加粗** 标出；"
         "不要使用标题、表格或代码块，只输出总结正文。"
@@ -527,7 +527,7 @@ class AiAdvisor:
                 except AiFormatError as err:
                     label = _job_label(key, schema)
                     self.errors.append(f"AI 返回内容不符合约定格式，已跳过该项（{label}）")
-                    logger.debug(f"影视库完整性检查：AI {label}回复无法解析：{err}")
+                    logger.debug(f"媒体库缺集检查：AI {label}回复无法解析：{err}")
                 except (asyncio.TimeoutError, TimeoutError):
                     self.errors.append(f"AI 请求超时（超过 {self.timeout:g} 秒未返回），已跳过该项（{_job_label(key, schema)}）")
                 except Exception as err:  # noqa: BLE001 - 模型或网络异常不应中断扫描
@@ -538,7 +538,7 @@ class AiAdvisor:
             try:
                 await self._llm_closer(llm)
             except Exception as err:  # noqa: BLE001
-                logger.debug(f"影视库完整性检查：释放大模型失败：{err}")
+                logger.debug(f"媒体库缺集检查：释放大模型失败：{err}")
         return results
 
     def advise(

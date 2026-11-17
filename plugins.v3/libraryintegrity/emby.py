@@ -44,7 +44,7 @@ def parse_release_name(name: str) -> dict[str, Optional[str]]:
         # 文件名可能以 .AAC 等音频编码结尾，强制按视频解析，避免被当作音频文件
         meta = MetaInfo(name, force_video=True)
     except Exception as err:  # noqa: BLE001 - 单个文件名解析失败不应中断整轮扫描
-        logger.debug(f"影视库完整性检查：文件名解析失败 {name}：{err}")
+        logger.debug(f"媒体库缺集检查：文件名解析失败 {name}：{err}")
         return {}
     return {
         "resolution": normalize_resolution_text(meta.resource_pix),

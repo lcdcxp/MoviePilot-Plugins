@@ -65,7 +65,7 @@ class TmdbSource:
         except FileNotFoundError:
             return {}
         except (OSError, ValueError) as err:
-            logger.warning(f"影视库完整性检查：TMDB 缓存无法读取，已重建：{err}")
+            logger.warning(f"媒体库缺集检查：TMDB 缓存无法读取，已重建：{err}")
             return {}
 
     def _client(self) -> Any:
@@ -203,7 +203,7 @@ class TmdbSource:
             tmp.replace(self._cache_file)
             self._dirty = False
         except OSError as err:
-            logger.warning(f"影视库完整性检查：TMDB 缓存保存失败：{err}")
+            logger.warning(f"媒体库缺集检查：TMDB 缓存保存失败：{err}")
 
     def close(self) -> None:
         """释放 TMDB 客户端。"""
@@ -211,5 +211,5 @@ class TmdbSource:
             try:
                 self._api.close()
             except Exception as err:  # noqa: BLE001
-                logger.debug(f"影视库完整性检查：TMDB 客户端关闭失败：{err}")
+                logger.debug(f"媒体库缺集检查：TMDB 客户端关闭失败：{err}")
         self._api = None

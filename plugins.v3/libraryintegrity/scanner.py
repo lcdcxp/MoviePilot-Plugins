@@ -256,7 +256,7 @@ class LibraryScanner:
                     tmdb_series = self.tmdb.get_series(series.tmdb_id)
                 except TmdbLookupError as err:
                     issues.append(unchecked_issue(series, f"TMDB 查询失败，未核对缺集：{err}"))
-                    logger.debug(f"影视库完整性检查：{series.title} TMDB 查询失败：{err}")
+                    logger.debug(f"媒体库缺集检查：{series.title} TMDB 查询失败：{err}")
                 else:
                     mappings = self.options.number_mappings.get(f"tmdb:{series.tmdb_id}")
                     matches = match_episodes(series, tmdb_series, mappings)
@@ -393,7 +393,7 @@ class LibraryScanner:
                 try:
                     task.candidates = self.tmdb.search_tv(task.series.title, task.series.year)[:MAX_CANDIDATES]
                 except TmdbLookupError as err:
-                    logger.debug(f"影视库完整性检查：搜索候选失败 {task.series.title}：{err}")
+                    logger.debug(f"媒体库缺集检查：搜索候选失败 {task.series.title}：{err}")
         identity_tasks = [task for task in self._identity_tasks if task.candidates]
         numbering_ask, numbering_reuse = self._split_cached(self._numbering_tasks, NumberingAnswer)
         identity_ask, identity_reuse = self._split_cached(identity_tasks, IdentityAnswer)
@@ -443,7 +443,7 @@ class LibraryScanner:
         """记录新请求到的回答；reason 为 None 表示通过，空字符串表示暂时无法验证（不缓存）。"""
         if reason:
             retry = self.today + timedelta(days=FAILED_RETRY_DAYS)
-            logger.info(f"影视库完整性检查：{task.series.title} 的 AI {kind}建议未通过验证（{reason}），已丢弃，{retry} 前不再请求")
+            logger.info(f"媒体库缺集检查：{task.series.title} 的 AI {kind}建议未通过验证（{reason}），已丢弃，{retry} 前不再请求")
         if self.ai_cache is not None and reason != "":
             self.ai_cache.put(task_fingerprint(task), answer, reason is None, reason or "", self.today)
 
@@ -460,15 +460,15 @@ class LibraryScanner:
         if entry.passed:
             if reason is not None:
                 if reason:
-                    logger.info(f"影视库完整性检查：{task.series.title} 上次的 AI {kind}建议按当前数据不再成立（{reason}），下次扫描重新请求")
+                    logger.info(f"媒体库缺集检查：{task.series.title} 上次的 AI {kind}建议按当前数据不再成立（{reason}），下次扫描重新请求")
                 self.ai_cache.drop(key)
             return
         if reason is None:
-            logger.info(f"影视库完整性检查：{task.series.title} 上次未通过验证的 AI {kind}建议按当前规则已通过，恢复展示")
+            logger.info(f"媒体库缺集检查：{task.series.title} 上次未通过验证的 AI {kind}建议按当前规则已通过，恢复展示")
             self.ai_cache.put(key, answer, True, "", self.today)
         elif reason:
             logger.info(
-                f"影视库完整性检查：{task.series.title} 的 AI {kind}建议上次未通过验证（{reason}），"
+                f"媒体库缺集检查：{task.series.title} 的 AI {kind}建议上次未通过验证（{reason}），"
                 f"库内情况未变，{entry.retry_on()} 前不再请求"
             )
 
@@ -534,7 +534,7 @@ class LibraryScanner:
         try:
             tmdb_series = self.tmdb.get_series(int(candidate["id"]))
         except (TmdbLookupError, KeyError, TypeError, ValueError) as err:
-            logger.debug(f"影视库完整性检查：{task.series.title} 的 AI 身份建议无法验证：{err}")
+            logger.debug(f"媒体库缺集检查：{task.series.title} 的 AI 身份建议无法验证：{err}")
             return ""
         coverage = identity_coverage(task.series, tmdb_series)
         if coverage < MIN_IDENTITY_COVERAGE:

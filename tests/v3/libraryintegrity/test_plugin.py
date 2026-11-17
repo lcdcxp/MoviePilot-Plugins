@@ -1,4 +1,4 @@
-"""影视库完整性检查：插件主类配置、页面、接口与扫描生命周期测试。"""
+"""媒体库缺集检查：插件主类配置、页面、接口与扫描生命周期测试。"""
 
 import atexit
 import json
@@ -292,8 +292,8 @@ def test_run_scan_logs_errors(scan_plugin, monkeypatch):
     warnings = []
     monkeypatch.setattr(plugin_module.logger, "warning", lambda message, *args, **kwargs: warnings.append(message))
     scan_plugin.run_scan()
-    assert "影视库完整性检查：Emby 服务器 备用 未连接" in warnings
-    assert "影视库完整性检查：Emby 没有匹配的影视媒体库" in warnings
+    assert "媒体库缺集检查：Emby 服务器 备用 未连接" in warnings
+    assert "媒体库缺集检查：Emby 没有匹配的影视媒体库" in warnings
 
 
 def test_run_scan_annotates_missing_with_subscriptions(scan_plugin, monkeypatch):
@@ -378,7 +378,7 @@ def test_real_instance_lifecycle_and_storage(monkeypatch):
     assert plugin.get_data("report") is None
     assert plugin._report_path().exists()
     assert plugin.get_state()
-    assert plugin.get_service()[0]["name"] == "影视库完整性检查"
+    assert plugin.get_service()[0]["name"] == "媒体库缺集检查"
     plugin.get_form()
     page = plugin.get_page()
     assert any(node.get("text") == "缺集" for node in _walk(page))
@@ -490,7 +490,7 @@ def test_agent_tool_queries_running_plugin(monkeypatch):
     tool = object.__new__(tool_cls)
     assert asyncio.run(tool.run(issue_type="missing", keyword="剧", limit=5)) == "missing|剧|5"
     monkeypatch.setattr(PluginManager, "running_plugins", property(lambda self: {}))
-    assert asyncio.run(tool.run()) == "影视库完整性检查插件未运行"
+    assert asyncio.run(tool.run()) == "媒体库缺集检查插件未运行"
 
 
 def test_build_sources_and_advisor(tmp_path, monkeypatch):

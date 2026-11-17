@@ -64,7 +64,7 @@ def build_agent_tools(plugin_id: str) -> list[Type[Any]]:
 
             plugin = PluginManager().running_plugins.get(plugin_id)
             if plugin is None or not hasattr(plugin, "async_query_text"):
-                return "影视库完整性检查插件未运行"
+                return "媒体库缺集检查插件未运行"
             return await plugin.async_query_text(issue_type=issue_type, keyword=keyword, limit=limit)
 
     return [LibraryIntegrityQueryTool]

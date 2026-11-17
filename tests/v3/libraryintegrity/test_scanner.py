@@ -1,4 +1,4 @@
-"""影视库完整性检查：扫描编排端到端测试（Emby、TMDB、AI 使用替身，NFO 使用临时文件）。"""
+"""媒体库缺集检查：扫描编排端到端测试（Emby、TMDB、AI 使用替身，NFO 使用临时文件）。"""
 
 import json
 import threading

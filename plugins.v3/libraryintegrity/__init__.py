@@ -1,4 +1,4 @@
-"""影视库完整性检查：基于 Emby 检查缺集、同季版本一致性与多文件，只生成报告。"""
+"""媒体库缺集检查：基于 Emby 检查缺集、同季版本一致性与多文件，只生成报告。"""
 
 import asyncio
 import json
@@ -90,12 +90,12 @@ class ReportView(BaseModel):
 
 
 class LibraryIntegrity(_PluginBase):
-    """影视库完整性检查插件主类：管理配置、定时与手动扫描、报告页和接口。"""
+    """媒体库缺集检查插件主类：管理配置、定时与手动扫描、报告页和接口。"""
 
-    plugin_name = "影视库完整性检查"
+    plugin_name = "媒体库缺集检查"
     plugin_desc = "检查剧集缺集、同季版本不一致与多文件，支持 Emby 与本地目录（含 strm、NFO、媒体信息），可选 AI 建议，只生成报告不改动文件。"
     plugin_icon = "Emby_A.png"
-    plugin_version = "1.0.13"
+    plugin_version = "1.0.14"
     plugin_label = "媒体库,Emby,检查,AI"
     plugin_author = "Derrors"
     author_url = "https://github.com/Derrors"
@@ -129,7 +129,7 @@ class LibraryIntegrity(_PluginBase):
             if self._enabled:
                 self._queue_scan()
             else:
-                logger.warning("影视库完整性检查：插件未启用，已忽略立即扫描")
+                logger.warning("媒体库缺集检查：插件未启用，已忽略立即扫描")
 
     def get_state(self) -> bool:
         """返回插件是否启用。"""
@@ -184,11 +184,11 @@ class LibraryIntegrity(_PluginBase):
         try:
             trigger = build_cron_trigger(self._config["cron"])
         except ValueError as err:
-            logger.error(f"影视库完整性检查：cron 表达式无效：{err}")
+            logger.error(f"媒体库缺集检查：cron 表达式无效：{err}")
             return []
         return [{
             "id": f"{self.__class__.__name__}.Scan",
-            "name": "影视库完整性检查",
+            "name": "媒体库缺集检查",
             "trigger": trigger,
             "func": self.run_scan,
             "kwargs": {},
@@ -213,7 +213,7 @@ class LibraryIntegrity(_PluginBase):
 
             return build_agent_tools(self.__class__.__name__)
         except Exception as err:  # noqa: BLE001 - 宿主未提供智能助手时不注册工具
-            logger.debug(f"影视库完整性检查：智能助手工具不可用：{err}")
+            logger.debug(f"媒体库缺集检查：智能助手工具不可用：{err}")
             return []
 
     def stop_service(self) -> None:
@@ -223,7 +223,7 @@ class LibraryIntegrity(_PluginBase):
         try:
             scheduler_sdk.remove_plugin_once_job(self.__class__.__name__, SCAN_JOB_ID)
         except Exception as err:  # noqa: BLE001 - 调度器未运行时不影响停止
-            logger.debug(f"影视库完整性检查：取消一次性扫描失败：{err}")
+            logger.debug(f"媒体库缺集检查：取消一次性扫描失败：{err}")
 
     # ------------------------------------------------------------------
     # 接口
@@ -314,7 +314,7 @@ class LibraryIntegrity(_PluginBase):
         if lock is None or stop_event is None:
             return
         if not lock.acquire(blocking=False):
-            logger.info("影视库完整性检查：已有扫描正在进行，跳过本次触发")
+            logger.info("媒体库缺集检查：已有扫描正在进行，跳过本次触发")
             return
         probe: Optional[MediaProbe] = None
         tmdb: Optional[TmdbSource] = None
@@ -329,7 +329,7 @@ class LibraryIntegrity(_PluginBase):
                 to_scan_options(config), tmdb, stop_event,
                 progress=self._set_progress, advisor=advisor, ai_cache=ai_cache,
             )
-            logger.info("影视库完整性检查：开始扫描")
+            logger.info("媒体库缺集检查：开始扫描")
             report = scanner.scan(sources)
             if probe is not None:
                 report.stats.probes = probe.probed
@@ -337,11 +337,11 @@ class LibraryIntegrity(_PluginBase):
                     report.errors.append(f"本轮新读取媒体信息已达上限，{probe.skipped} 个文件留到下次扫描")
             report.errors = errors + report.errors
             if report.cancelled:
-                logger.info("影视库完整性检查：扫描被停止，保留上一次报告")
+                logger.info("媒体库缺集检查：扫描被停止，保留上一次报告")
                 return
             # 报告每次扫描都会被覆盖，错误同时写入日志以便事后排查
             for error in report.errors:
-                logger.warning(f"影视库完整性检查：{error}")
+                logger.warning(f"媒体库缺集检查：{error}")
             if ai_cache is not None:
                 ai_cache.save()
             if any(issue.type == IssueType.MISSING for issue in report.issues):
@@ -349,17 +349,17 @@ class LibraryIntegrity(_PluginBase):
             self._save_report(report)
             visible, ignored = self._visible_issues(report)
             logger.info(
-                f"影视库完整性检查：扫描完成，{report.stats.series} 部剧，"
+                f"媒体库缺集检查：扫描完成，{report.stats.series} 部剧，"
                 f"{len(visible)} 条问题，忽略 {ignored} 条，耗时 {report.duration_seconds} 秒"
             )
             if config["notify"]:
                 self.post_message(
                     mtype=MessageType.Plugin,
-                    title="【影视库完整性检查】扫描完成",
+                    title="【媒体库缺集检查】扫描完成",
                     text=build_summary_text(report, visible, ignored),
                 )
         except Exception as err:  # noqa: BLE001 - 后台任务需记录异常而不是静默退出
-            logger.error(f"影视库完整性检查：扫描失败：{err}", exc_info=True)
+            logger.error(f"媒体库缺集检查：扫描失败：{err}", exc_info=True)
         finally:
             if tmdb is not None:
                 tmdb.save()
@@ -372,10 +372,10 @@ class LibraryIntegrity(_PluginBase):
     def _queue_scan(self) -> bool:
         """把扫描交给宿主调度器执行一次。"""
         queued = scheduler_sdk.add_plugin_once_job(
-            self.__class__.__name__, SCAN_JOB_ID, self.run_scan, "影视库完整性检查", delay_seconds=3
+            self.__class__.__name__, SCAN_JOB_ID, self.run_scan, "媒体库缺集检查", delay_seconds=3
         )
         if not queued:
-            logger.warning("影视库完整性检查：调度器未运行，无法加入扫描任务")
+            logger.warning("媒体库缺集检查：调度器未运行，无法加入扫描任务")
         return bool(queued)
 
     def _build_sources(
@@ -422,7 +422,7 @@ class LibraryIntegrity(_PluginBase):
             return None
         kind, binary = find_probe_binary(config["probe_path"])
         if not binary:
-            logger.warning("影视库完整性检查：未找到 ffprobe 或 mediainfo，跳过本地媒体信息读取")
+            logger.warning("媒体库缺集检查：未找到 ffprobe 或 mediainfo，跳过本地媒体信息读取")
             return None
         return MediaProbe(self.get_data_path() / "probe_cache.json", binary, kind, max_new=config["probe_max_files"])
 
@@ -450,7 +450,7 @@ class LibraryIntegrity(_PluginBase):
                     break
             return items
         except Exception as err:  # noqa: BLE001 - 宿主不提供订阅查询或查询失败时只是不标注
-            logger.warning(f"影视库完整性检查：读取订阅失败，缺集不标注订阅状态：{err}")
+            logger.warning(f"媒体库缺集检查：读取订阅失败，缺集不标注订阅状态：{err}")
             return []
 
     def _emby_server_names(self) -> List[str]:
@@ -460,7 +460,7 @@ class LibraryIntegrity(_PluginBase):
 
             configs = MediaServerHelper().get_configs()
         except Exception as err:  # noqa: BLE001
-            logger.debug(f"影视库完整性检查：读取媒体服务器配置失败：{err}")
+            logger.debug(f"媒体库缺集检查：读取媒体服务器配置失败：{err}")
             return []
         return [name for name, conf in configs.items() if str(getattr(conf, "type", "")).lower() == "emby"]
 
@@ -476,7 +476,7 @@ class LibraryIntegrity(_PluginBase):
             selected = self._config.get("servers") or None
             services = MediaServerHelper().get_services(type_filter="emby", name_filters=selected)
         except Exception as err:  # noqa: BLE001 - 配置页不能因读取失败而报错
-            logger.debug(f"影视库完整性检查：读取 Emby 服务器失败，媒体库候选为空：{err}")
+            logger.debug(f"媒体库缺集检查：读取 Emby 服务器失败，媒体库候选为空：{err}")
             return []
         names: List[str] = []
         seen: set = set()
@@ -487,7 +487,7 @@ class LibraryIntegrity(_PluginBase):
             try:
                 libraries = EmbyReader(str(name), instance).libraries()
             except Exception as err:  # noqa: BLE001 - 单台服务器失败不影响其它服务器
-                logger.debug(f"影视库完整性检查：读取 Emby 服务器 {name} 的媒体库失败：{err}")
+                logger.debug(f"媒体库缺集检查：读取 Emby 服务器 {name} 的媒体库失败：{err}")
                 continue
             # 名称列表传空：复用 select_libraries 的默认过滤，自动剔除音乐、书籍、家庭视频等非影视库
             for library_name, _library_id, _collection in select_libraries(libraries, []):
@@ -524,7 +524,7 @@ class LibraryIntegrity(_PluginBase):
         except FileNotFoundError:
             return None
         except (OSError, ValueError) as err:
-            logger.warning(f"影视库完整性检查：报告文件无法解析：{err}")
+            logger.warning(f"媒体库缺集检查：报告文件无法解析：{err}")
             return None
 
     def _migrate_legacy_report(self) -> None:
@@ -535,10 +535,10 @@ class LibraryIntegrity(_PluginBase):
                 return
             if not self._report_path().exists():
                 self._save_report(Report.model_validate(data))
-                logger.info("影视库完整性检查：已把旧版报告迁移到插件数据目录")
+                logger.info("媒体库缺集检查：已把旧版报告迁移到插件数据目录")
             self.del_data(LEGACY_REPORT_KEY)
         except Exception as err:  # noqa: BLE001 - 迁移失败不影响插件启动，下次扫描会生成新报告
-            logger.warning(f"影视库完整性检查：迁移旧版报告失败：{err}")
+            logger.warning(f"媒体库缺集检查：迁移旧版报告失败：{err}")
 
     async def async_query_text(
         self, issue_type: Optional[str] = None, keyword: Optional[str] = None, limit: int = 20

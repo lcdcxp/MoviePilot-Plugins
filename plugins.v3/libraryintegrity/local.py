@@ -107,7 +107,7 @@ def parse_numbers(stem: str) -> tuple[Optional[int], Optional[int], Optional[int
     try:
         meta = MetaInfo(stem, force_video=True)
     except Exception as err:  # noqa: BLE001 - 单个文件名解析失败不应中断扫描
-        logger.debug(f"影视库完整性检查：文件名解析失败 {stem}：{err}")
+        logger.debug(f"媒体库缺集检查：文件名解析失败 {stem}：{err}")
         return None, None, None, "", ""
     return (
         parse_int(meta.begin_season),
@@ -125,7 +125,7 @@ def history_tmdb_id(path: str) -> Optional[int]:
 
         history = TransferHistoryOper().get_by_dest(path)
     except Exception as err:  # noqa: BLE001 - 整理记录只是兜底来源
-        logger.debug(f"影视库完整性检查：查询整理记录失败 {path}：{err}")
+        logger.debug(f"媒体库缺集检查：查询整理记录失败 {path}：{err}")
         return None
     if history is None or str(getattr(history, "media_source", "") or "") != "themoviedb":
         return None
@@ -186,7 +186,7 @@ class LocalSource:
         if missing and len(missing) == len(self.roots):
             raise SourceError(f"本地目录不存在或无法访问：{'、'.join(missing)}")
         for root in missing:
-            logger.warning(f"影视库完整性检查：本地目录不存在或无法访问：{root}")
+            logger.warning(f"媒体库缺集检查：本地目录不存在或无法访问：{root}")
         return [(root, root, "mixed") for root in self.roots if Path(root).is_dir()]
 
     def iter_series(self, library: tuple[str, str, str]) -> Iterator[LibrarySeries]:

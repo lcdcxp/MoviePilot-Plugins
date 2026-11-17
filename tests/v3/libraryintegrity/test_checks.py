@@ -1,4 +1,4 @@
-"""影视库完整性检查：取值归一、忽略规则与缺集/版本/多文件规则测试。"""
+"""媒体库缺集检查：取值归一、忽略规则与缺集/版本/多文件规则测试。"""
 
 from dataclasses import replace
 from datetime import date, timedelta

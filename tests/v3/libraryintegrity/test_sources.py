@@ -1,4 +1,4 @@
-"""影视库完整性检查：NFO、strm 地址、Emby 解析与 TMDB 缓存测试。"""
+"""媒体库缺集检查：NFO、strm 地址、Emby 解析与 TMDB 缓存测试。"""
 
 import os
 
